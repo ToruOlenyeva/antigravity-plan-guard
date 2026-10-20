@@ -54,24 +54,21 @@ flowchart TD
 <b>macOS / Linux</b>:
 ```bash
 git clone https://github.com/ToruOlenyeva/antigravity-plan-guard.git ~/.gemini/config/plugins/plan-guard
-cp ~/.gemini/config/plugins/plan-guard/hooks.example.json ~/.gemini/config/plugins/plan-guard/hooks.json
 ```
 
 <b>Windows (PowerShell)</b>:
 ```powershell
 git clone https://github.com/ToruOlenyeva/antigravity-plan-guard.git "$env:USERPROFILE\.gemini\config\plugins\plan-guard"
-Copy-Item "$env:USERPROFILE\.gemini\config\plugins\plan-guard\hooks.example.json" "$env:USERPROFILE\.gemini\config\plugins\plan-guard\hooks.json"
 ```
 
 <b>Windows (CMD)</b>:
 ```cmd
 git clone https://github.com/ToruOlenyeva/antigravity-plan-guard.git %USERPROFILE%\.gemini\config\plugins\plan-guard
-copy %USERPROFILE%\.gemini\config\plugins\plan-guard\hooks.example.json %USERPROFILE%\.gemini\config\plugins\plan-guard\hooks.json
 ```
 
 ### 2. 生效与启动
 
-克隆并生成 `hooks.json`（请将模板中的 `<ABSOLUTE_PATH_TO_PLUGINS>` 替换为你的实际插件目录绝对路径）后，重启 Google Antigravity 或通过 `plugin-switcher` 面板一键启用即可生效。
+克隆完成后，重启 Google Antigravity 或通过 `plugin-switcher` 面板一键启用即可生效。
 
 ---
 

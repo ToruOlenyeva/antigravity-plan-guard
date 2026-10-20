@@ -54,24 +54,21 @@ Built with native Node.js and <b>Zero Dependencies</b>. Clone and run immediatel
 <b>macOS / Linux</b>:
 ```bash
 git clone https://github.com/ToruOlenyeva/antigravity-plan-guard.git ~/.gemini/config/plugins/plan-guard
-cp ~/.gemini/config/plugins/plan-guard/hooks.example.json ~/.gemini/config/plugins/plan-guard/hooks.json
 ```
 
 <b>Windows (PowerShell)</b>:
 ```powershell
 git clone https://github.com/ToruOlenyeva/antigravity-plan-guard.git "$env:USERPROFILE\.gemini\config\plugins\plan-guard"
-Copy-Item "$env:USERPROFILE\.gemini\config\plugins\plan-guard\hooks.example.json" "$env:USERPROFILE\.gemini\config\plugins\plan-guard\hooks.json"
 ```
 
 <b>Windows (CMD)</b>:
 ```cmd
 git clone https://github.com/ToruOlenyeva/antigravity-plan-guard.git %USERPROFILE%\.gemini\config\plugins\plan-guard
-copy %USERPROFILE%\.gemini\config\plugins\plan-guard\hooks.example.json %USERPROFILE%\.gemini\config\plugins\plan-guard\hooks.json
 ```
 
 ### 2. Enable and Launch
 
-After cloning and generating `hooks.json` (replace `<ABSOLUTE_PATH_TO_PLUGINS>` in `hooks.json` with your actual plugins directory path), restart Google Antigravity or toggle the plugin directly in `plugin-switcher`.
+Restart Google Antigravity or toggle the plugin directly in `plugin-switcher` after cloning.
 
 ---
 
