@@ -50,23 +50,24 @@ graph TD
 
 - <b>执行时机</b>：模型输出工具调用意图之后，宿主实际执行之前。
 - <b>核心职责</b>：解析即将被调用的工具名称与参数负载，匹配白名单规则与当前确认状态。若未达放行标准，返回拒绝指令并附带标准化操作指南。
-- <b>方案工件防重校验（`RequestFeedback: false`）</b>：简单任务免写 `implementation_plan.md`；复杂任务放行写入 `implementation_plan.md` 等工件目录，但物理校验 `ArtifactMetadata.RequestFeedback` 必须为 `false`，杜绝回合结束时额外弹出原生 `Proceed` 按钮造成双重确认。
+- <b>复杂度分级与卡片呈现策略</b>：简单任务（`≤ 3` 文件）免写 `implementation_plan.md`（不弹大卡片，直接正文解释 + `ask_question` 确认）；复杂任务（`> 3` 文件或多方案架构设计）放行写入 `implementation_plan.md` 工件，配合 `ask_question` 选项面板与回合结束自动挂载的 `Implementation Plan` 大卡片形成双层交互。
 
-### 3.3 原生 Proceed 按钮底层触发机制与防重边界
+### 3.3 Implementation Plan 大卡片与原生 Proceed 按钮的前端生命周期
 
-经对 Antigravity 2.0 宿主事件流（`transcript.jsonl`）与工具协议的实测验证，原生蓝色「继续 `Ctrl+↵`」（`Proceed`）按钮的触发规律如下：
+经对 Antigravity 2.0 宿主事件流（`transcript.jsonl`）与前端渲染状态的实测比对，`Implementation Plan` 大卡片与蓝色「继续 `Ctrl+↵`」（`Proceed`）按钮的底层生命周期规律如下：
 
 1. <b>非独立工具，强绑定 Artifact 工件载体</b>：
-   - 宿主工具箱中不存在独立的 `Proceed` 按钮工具；该按钮是 `write_file` / `edit_file` 写入 `.gemini/antigravity/brain/<conversation-id>/` 工件目录（尤其是 `implementation_plan.md`）并携带 `ArtifactMetadata` 时的专属 UI 附属控件。不落盘 Artifact `.md` 文件则前端无挂载载体，无法弹出 `Proceed` 按钮。
+   - 宿主工具箱中不存在独立的 `Proceed` 按钮工具；大卡片与该按钮是 `write_file` / `edit_file` 写入 `.gemini/antigravity/brain/<conversation-id>/` 工件目录（如 `implementation_plan.md`）并携带 `ArtifactMetadata` 时的专属 UI 附属控件。不落盘 Artifact `.md` 文件则前端无挂载载体，不会渲染大卡片。
 2. <b>非阻塞写入与「回合结束（Yield Turn）」延迟挂载机制</b>：
-   - `ask_question` 为阻塞式工具（调用即刻挂起当前回合并渲染选项弹窗）；而 `write_file(implementation_plan.md)` 为毫秒级非阻塞调用，返回 `"Created file."` 后模型仍处于当前推理回合内。
-   - 宿主前端<b>仅在模型彻底停止调用后续工具、主动结束当前回合（Yield Turn）的那一刻</b>，才会在该回合末尾挂载 `Implementation Plan` 审阅卡片与「继续 `Ctrl+↵`」按钮。
-   - 若模型在同一回合内既写入了 `implementation_plan.md` 又调用了 `ask_question` 或其他工具，则 `Proceed` 卡片不会在写文件瞬间出现，而是被推迟到后续模型真正结束回合（`0 tool calls`）时才延迟弹出，从而造成二次确认干扰。
-3. <b>客户端 `Artifact Review Mode` 三档设置与 `RequestFeedback` 优先级</b>：
-   - <b>`asks-for-review`（总是请求审查）</b>：前端无视模型传入的 `RequestFeedback: false`，只要本轮写入了 `UserFacing: true` 的 `implementation_plan.md`，回合结束时必然强行弹出 `Proceed` 按钮；
-   - <b>`agent-decides`（由智能体决定） / `always-proceed`（直接放行）</b>：前端严格遵循 `ArtifactMetadata.RequestFeedback` 参数——当 `guard.cjs` 阶段 3 强制锁定 `RequestFeedback: false` 时，前端不再弹出冗余的 `Proceed` 按钮，全流程统一由 `ask_question` 单点完成确认。
+   - `ask_question` 为回合内阻塞式工具（调用即刻挂起当前回合并渲染选项弹窗）；而 `write_file(implementation_plan.md)` 为毫秒级非阻塞调用，返回 `"Created file."` 后模型仍处于当前推理回合内。
+   - 宿主前端在 `write_file` 调用瞬间<b>不会立即渲染大卡片</b>，而是将其暂存于当前回合队列中；<b>仅当模型彻底停止调用后续工具、主动结束当前回合（Yield Turn）的那一瞬间</b>，前端才会在该回合消息气泡底部挂载可点击的 `Implementation Plan` 大卡片。
+   - 因此，当同一回合内先后调用 `write_file(implementation_plan.md)` 与 `ask_question` 时，在等待用户点击 `ask_question` 期间大卡片尚未挂载（此时可通过正文中的 `[implementation_plan.md](file:///...)` 链接芯片点击展开右侧分栏预览），待用户回答完毕且该回合结束时，大卡片即刻挂载落位。
+3. <b>蓝色「继续 `Ctrl+↵`」按钮的激活态显隐规则（与 `RequestFeedback` 无关）</b>：
+   - 实测证明，无论 `ArtifactMetadata.RequestFeedback` 设为 `true` 还是 `false`，只要本轮写入了 `UserFacing: true` 的 `implementation_plan.md`，大卡片右下角的蓝色「继续 `Ctrl+↵`」按钮显隐均由<b>该消息是否处于聊天流最底部激活态</b>唯一决定：
+     - <b>激活态（显示按钮）</b>：当挂载了 `Implementation Plan` 大卡片的回复气泡处于整个聊天窗口的<b>最底部最后一条消息</b>时（例如主智能体派发后台子智能体 `1 subagent running` 并暂停自身回合等待子智能体返回的 1~3 分钟窗口期内），卡片右下角会显示蓝色「继续 `Ctrl+↵`」按钮；
+     - <b>历史态（自动隐藏按钮，沉淀为纯净大卡片）</b>：一旦子智能体执行完毕、主智能体在下方输出最终验收总结，或用户在多方案回合后开启了新一轮对话，原消息气泡不再处于聊天窗口最底部，前端便会<b>自动销毁隐藏该卡片右下角的蓝色「继续 `Ctrl+↵`」按钮</b>，仅保留干净、宽大且可随时点击展开的 `Implementation Plan` 历史大卡片。
 4. <b>点击 `Proceed` 后的底层日志报文结构</b>：
-   - 当用户点击「继续 `Ctrl+↵`」按钮时，宿主向 `transcript.jsonl` 追加一条 `source: "USER_EXPLICIT", type: "USER_INPUT"` 记录，固定载荷格式为：
+   - 若用户直接点击「继续 `Ctrl+↵`」按钮，宿主向 `transcript.jsonl` 追加一条 `source: "USER_EXPLICIT", type: "USER_INPUT"` 记录，固定载荷格式为：
      ```text
      Comments on artifact URI: file:///.../implementation_plan.md
 
