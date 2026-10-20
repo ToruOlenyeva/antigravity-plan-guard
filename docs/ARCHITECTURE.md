@@ -48,6 +48,7 @@ graph TD
 
 - <b>执行时机</b>：模型输出工具调用意图之后，宿主实际执行之前。
 - <b>核心职责</b>：解析即将被调用的工具名称与参数负载，匹配白名单规则与当前确认状态。若未达放行标准，返回拒绝指令并附带标准化操作指南。
+- <b>方案工件防重校验（`RequestFeedback: false`）</b>：简单任务免写 `implementation_plan.md`；复杂任务放行写入 `implementation_plan.md` 等工件目录，但物理校验 `ArtifactMetadata.RequestFeedback` 必须为 `false`，杜绝回合结束时额外弹出原生 `Proceed` 按钮造成双重确认。
 
 ---
 
