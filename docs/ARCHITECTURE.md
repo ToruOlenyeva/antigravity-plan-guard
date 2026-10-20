@@ -50,6 +50,8 @@ graph TD
 
 - <b>执行时机</b>：模型输出工具调用意图之后，宿主实际执行之前。
 - <b>核心职责</b>：解析即将被调用的工具名称与参数负载，匹配白名单规则与当前确认状态。若未达放行标准，返回拒绝指令并附带标准化操作指南。
+- <b>只读命令白名单穿透</b>：除内置纯只读工具外，终端命令层严格审计管道与重定向，精准放行本地纯只读查询（如 `git -C <path> status/log/diff/branch/show`、`dir`、`ls`、`grep` 等）与远程只读 SSH 查询。
+- <b>60 秒滑动续期放行窗口（Sliding Approval Window）</b>：针对多步写盘、代码构建及 `call_mcp_tool` 浏览器自动化等多步骤连续任务，只要在首次通过 `ask_question` 或显式指令授权后，门禁在受控工具放行与 `PostToolUse` 执行完毕时自动滑动刷新 60 秒有效期，确保多步自动化连续放行不断流。
 - <b>复杂度分级与卡片呈现策略</b>：简单任务（`≤ 3` 文件）免写 `implementation_plan.md`（不弹大卡片，直接正文解释 + `ask_question` 确认）；复杂任务（`> 3` 文件或多方案架构设计）放行写入 `implementation_plan.md` 工件，配合 `ask_question` 选项面板与回合结束自动挂载的 `Implementation Plan` 大卡片形成双层交互。
 
 ### 3.3 Implementation Plan 大卡片与原生 Proceed 按钮的前端生命周期

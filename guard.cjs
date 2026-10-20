@@ -2,6 +2,37 @@
 const fs = require("fs");
 const path = require("path");
 
+const APPROVED_WINDOW_MS = 60000;
+
+function getStatePath(transcriptPath) {
+  if (transcriptPath) {
+    try {
+      const dir = path.dirname(transcriptPath);
+      return path.join(dir, "guard-state.json");
+    } catch (e) {}
+  }
+  const os = require("os");
+  return path.join(os.tmpdir(), "antigravity-plan-guard-state.json");
+}
+
+function loadState(statePath) {
+  try {
+    if (statePath && fs.existsSync(statePath)) {
+      const data = JSON.parse(fs.readFileSync(statePath, "utf8"));
+      if (data && typeof data === "object") return data;
+    }
+  } catch (e) {}
+  return { approved: false, approvedAt: 0 };
+}
+
+function saveState(statePath, state) {
+  try {
+    if (statePath) {
+      fs.writeFileSync(statePath, JSON.stringify(state, null, 2), "utf8");
+    }
+  } catch (e) {}
+}
+
 const SAFE_READ_TOOLS = new Set([
   "view_file",
   "view_file_outline",
@@ -149,8 +180,8 @@ function isPureReadOnlyCommand(cmd) {
     return false;
   }
 
-  // 3. 本地纯只读查询命令白名单
-  const localSafeReads = /^(git\s+(status|log|diff|branch|show)|dir|ls|get-childitem|cat|type|get-content|head|tail|grep|select-string|findstr|npm\s+run\s+test:docs|npm\s+test|cargo\s+check)(\s|$)/;
+  // 3. 本地纯只读查询命令白名单（支持 git -C <path> 前缀）
+  const localSafeReads = /^(git\s+(-C\s+("[^"]+"|'[^']+'|\S+)\s+)?(status|log|diff|branch|show)|dir|ls|get-childitem|cat|type|get-content|head|tail|grep|select-string|findstr|npm\s+run\s+test:docs|npm\s+test|cargo\s+check)(\s|$)/;
   if (localSafeReads.test(c)) return true;
 
   return false;
@@ -315,6 +346,11 @@ function handlePreToolUse(payload) {
     }
 
     // 阶段 5：状态机扫描对话历史（区分主智能体与子智能体；主智能体统一通过 ask_question 按钮确认）
+    const statePath = getStatePath(payload.transcriptPath);
+    const state = loadState(statePath);
+    const now = Date.now();
+    const isStateWindowValid = Boolean(state.approved && (now - (state.approvedAt || 0) <= APPROVED_WINDOW_MS));
+
     let tPath = payload.transcriptPath || "";
     const fullPath = tPath.endsWith("transcript.jsonl")
       ? tPath.replace(/transcript\.jsonl$/, "transcript_full.jsonl")
@@ -369,8 +405,13 @@ function handlePreToolUse(payload) {
           currentAskStepHasContent = false;
           if (isUserAuthorized(content)) {
             isApproved = true;
+            state.approved = true;
+            state.approvedAt = now;
+            saveState(statePath, state);
           } else {
             isApproved = false;
+            state.approved = false;
+            saveState(statePath, state);
             lastResetReason = "user_input";
           }
           continue;
@@ -452,8 +493,13 @@ function handlePreToolUse(payload) {
             hasAssistantContentSinceLastReset = false;
             if (askEval.approved) {
               isApproved = true;
+              state.approved = true;
+              state.approvedAt = now;
+              saveState(statePath, state);
             } else {
               isApproved = false;
+              state.approved = false;
+              saveState(statePath, state);
               lastResetReason = askEval.isWriteIn ? "write_in" : "ask_rejected";
             }
             pendingToolCalls = [];
@@ -500,8 +546,11 @@ function handlePreToolUse(payload) {
       return reply({ decision: "allow" });
     }
 
-    // 分支 1：已通过 ask_question 预设选项点击或明确授权 -> 直接放行
-    if (isApproved) {
+    // 分支 1：已通过 ask_question 预设选项点击或明确授权，或处于 60s 滑动续期窗口 -> 直接放行并刷新滑动窗口
+    if (isApproved || isStateWindowValid) {
+      state.approved = true;
+      state.approvedAt = now;
+      saveState(statePath, state);
       return reply({ decision: "allow" });
     }
 
@@ -577,6 +626,13 @@ function handlePostToolUse(payload) {
       if (isWhitelistedTarget(rawTarget)) {
         stripArtifactFeedbackButton(rawTarget, false);
       }
+    }
+    // 60s 滑动续期窗口：当非 ask_question 的受控工具或 call_mcp_tool 执行完毕且当前 state.approved 为 true 时刷新
+    const statePath = getStatePath(payload.transcriptPath);
+    const state = loadState(statePath);
+    if (state.approved && toolName !== "ask_question") {
+      state.approvedAt = Date.now();
+      saveState(statePath, state);
     }
   } catch (e) {}
   return reply({});
