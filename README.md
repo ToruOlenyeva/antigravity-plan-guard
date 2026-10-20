@@ -18,6 +18,10 @@
 
 > <b>终结 AI 擅自改代码与无效弹窗干扰</b>：专为 <b>Google Antigravity 2.0</b>（并行多智能体桌面客户端）打造。针对大模型在复杂任务中未经确认直接覆写源码、或在输出 `implementation_plan.md` 工件时重复弹出原生 `Proceed` 与 `ask_question` 双重确认框的痛点，在 `PreToolUse` / `PostToolUse` 底层构建零信任确定性状态机门禁。
 
+<div align="center">
+  <img src="assets/preview-zh.png" width="840" alt="Antigravity Plan Guard Preview" />
+</div>
+
 ---
 
 ## ✨ 核心特性

@@ -715,14 +715,6 @@ function handlePostToolUse(payload) {
       state.approvedAt = Date.now();
       saveState(statePath, state);
     }
-    if (toolName === "ask_question" && state.approved) {
-      const userLang = detectUserLang(payload.transcriptPath);
-      const zhMsg = "【方案已获用户确认批准】用户已通过按钮确认方案。请在 60 秒有效期内以最高效率并发完成代码落盘与自测核销。";
-      const enMsg = "[Plan Approved by User] User confirmed execution via button. Within the 60-second window, proceed efficiently to complete code modifications and verifications concurrently.";
-      return reply({
-        injectSteps: [{ ephemeralMessage: userLang === "zh" ? zhMsg : enMsg }]
-      });
-    }
   } catch (e) {}
   return reply({});
 }

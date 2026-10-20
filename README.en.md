@@ -18,6 +18,10 @@
 
 > <b>Stop unauthorized code mutations and duplicate confirmation prompts</b>: Purpose-built for <b>Google Antigravity 2.0</b> (the parallel multi-agent desktop client). Solves the critical issue where LLMs overwrite source files without approval or trigger duplicate native `Proceed` and `ask_question` prompts when writing `implementation_plan.md` artifacts, enforcing a deterministic zero-trust state machine at the `PreToolUse` / `PostToolUse` hook layer.
 
+<div align="center">
+  <img src="assets/preview-en.png" width="840" alt="Antigravity Plan Guard Preview" />
+</div>
+
 ---
 
 ## ✨ Key Features
