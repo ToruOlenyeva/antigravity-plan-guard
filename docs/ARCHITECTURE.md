@@ -1,3 +1,5 @@
+[English](ARCHITECTURE.en.md) | [简体中文](ARCHITECTURE.md)
+
 # Antigravity Plan Guard 架构设计规范
 
 本文档详述 Google Antigravity 2.0 方案先行零信任门禁系统（`plan-guard`）的底层架构、生命周期钩子执行机制以及状态机演进模型。
@@ -49,6 +51,28 @@ graph TD
 - <b>执行时机</b>：模型输出工具调用意图之后，宿主实际执行之前。
 - <b>核心职责</b>：解析即将被调用的工具名称与参数负载，匹配白名单规则与当前确认状态。若未达放行标准，返回拒绝指令并附带标准化操作指南。
 - <b>方案工件防重校验（`RequestFeedback: false`）</b>：简单任务免写 `implementation_plan.md`；复杂任务放行写入 `implementation_plan.md` 等工件目录，但物理校验 `ArtifactMetadata.RequestFeedback` 必须为 `false`，杜绝回合结束时额外弹出原生 `Proceed` 按钮造成双重确认。
+
+### 3.3 原生 Proceed 按钮底层触发机制与防重边界
+
+经对 Antigravity 2.0 宿主事件流（`transcript.jsonl`）与工具协议的实测验证，原生蓝色「继续 `Ctrl+↵`」（`Proceed`）按钮的触发规律如下：
+
+1. <b>非独立工具，强绑定 Artifact 工件载体</b>：
+   - 宿主工具箱中不存在独立的 `Proceed` 按钮工具；该按钮是 `write_file` / `edit_file` 写入 `.gemini/antigravity/brain/<conversation-id>/` 工件目录（尤其是 `implementation_plan.md`）并携带 `ArtifactMetadata` 时的专属 UI 附属控件。不落盘 Artifact `.md` 文件则前端无挂载载体，无法弹出 `Proceed` 按钮。
+2. <b>非阻塞写入与「回合结束（Yield Turn）」延迟挂载机制</b>：
+   - `ask_question` 为阻塞式工具（调用即刻挂起当前回合并渲染选项弹窗）；而 `write_file(implementation_plan.md)` 为毫秒级非阻塞调用，返回 `"Created file."` 后模型仍处于当前推理回合内。
+   - 宿主前端<b>仅在模型彻底停止调用后续工具、主动结束当前回合（Yield Turn）的那一刻</b>，才会在该回合末尾挂载 `Implementation Plan` 审阅卡片与「继续 `Ctrl+↵`」按钮。
+   - 若模型在同一回合内既写入了 `implementation_plan.md` 又调用了 `ask_question` 或其他工具，则 `Proceed` 卡片不会在写文件瞬间出现，而是被推迟到后续模型真正结束回合（`0 tool calls`）时才延迟弹出，从而造成二次确认干扰。
+3. <b>客户端 `Artifact Review Mode` 三档设置与 `RequestFeedback` 优先级</b>：
+   - <b>`asks-for-review`（总是请求审查）</b>：前端无视模型传入的 `RequestFeedback: false`，只要本轮写入了 `UserFacing: true` 的 `implementation_plan.md`，回合结束时必然强行弹出 `Proceed` 按钮；
+   - <b>`agent-decides`（由智能体决定） / `always-proceed`（直接放行）</b>：前端严格遵循 `ArtifactMetadata.RequestFeedback` 参数——当 `guard.cjs` 阶段 3 强制锁定 `RequestFeedback: false` 时，前端不再弹出冗余的 `Proceed` 按钮，全流程统一由 `ask_question` 单点完成确认。
+4. <b>点击 `Proceed` 后的底层日志报文结构</b>：
+   - 当用户点击「继续 `Ctrl+↵`」按钮时，宿主向 `transcript.jsonl` 追加一条 `source: "USER_EXPLICIT", type: "USER_INPUT"` 记录，固定载荷格式为：
+     ```text
+     Comments on artifact URI: file:///.../implementation_plan.md
+
+     The user has approved this document.
+     ```
+   - `guard.cjs` 的 `isUserAuthorized()` 同步兼容识别 `approved this document` 特征串，实现状态机授权收敛。
 
 ---
 
