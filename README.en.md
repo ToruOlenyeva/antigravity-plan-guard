@@ -120,7 +120,6 @@ For custom rule definitions, refer to [Architecture Specification](docs/ARCHITEC
 ## 📚 Architecture and Advanced Docs
 
 - [System Architecture Specification (English)](docs/ARCHITECTURE.en.md)
-- [系统详细架构文档 (中文)](docs/ARCHITECTURE.md)
 - [Chinese Documentation (README.md)](README.md)
 
 ---
