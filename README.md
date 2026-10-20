@@ -24,7 +24,7 @@
 
 - <b>零信任写盘硬拦截</b>：严格监控 `PreToolUse` 生命周期，所有代码写盘、文件覆盖及具有副作用的终端命令在未获用户确认前均被硬阻断，并向模型回传结构化引导指令。
 - <b>同回合正文解释强约束</b>：强制要求主智能体在调用 `ask_question` 弹窗的同一回合内先在聊天正文输出完整原因分析，弹窗内仅展示纯修改方案与可点击文件芯片。
-- <b>原生 `Proceed` 双弹窗消重</b>：自动拦截工件写入时的 `ArtifactMetadata.RequestFeedback: true`，消除底部原生 `Proceed` 审查条与 `ask_question` 弹窗的重复打扰。
+- <b>无按钮纯净 `Implementation Plan` 大卡片守护</b>：针对宿主 `language_server.exe` 的 Go `proto3` 零值忽略特性，在 `PreToolUse`、`PostToolUse` 及异步守护层自动将磁盘 `.metadata.json` 中的 `requestFeedback` 物理覆写为 `false`，彻底剥离卡片右下角冗余的蓝色「继续 `Ctrl+↵`」（`Proceed`）按钮，仅保留干净可点击的方案大卡片。
 - <b>子智能体免打扰直通</b>：通过会话 `transcript.jsonl` 溯源自动识别由主智能体委派的子智能体（Subagent），主智能体单点确认后子智能体直接高速并发落盘，零二次弹窗阻塞。
 - <b>零外部依赖轻量设计</b>：单文件纯原生 Node.js 实现（`guard.cjs`），零第三方 npm 包依赖，亚毫秒级状态机裁决。
 

@@ -12,6 +12,18 @@
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node guard.cjs post-tool",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PreInvocation": [
       {
         "type": "command",

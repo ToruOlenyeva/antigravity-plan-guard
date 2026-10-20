@@ -24,7 +24,7 @@
 
 - <b>Zero-Trust Write Interception</b>: Strictly monitors the `PreToolUse` lifecycle. All source code writes, file edits, and side-effect terminal commands are blocked prior to explicit user approval, returning structured remediation directives to the model.
 - <b>Same-Turn Explanation Enforcement</b>: Compels the primary agent to output a complete root-cause and architectural explanation in the chat body within the exact same turn as calling the `ask_question` modal.
-- <b>Native `Proceed` Duplicate Suppression</b>: Automatically intercepts `ArtifactMetadata.RequestFeedback: true` when writing plan artifacts, eliminating redundant native `Proceed` review bars alongside `ask_question` modals.
+- <b>Buttonless Clean `Implementation Plan` Card Guard</b>: Bypasses the Go `proto3` zero-value omission quirk in `language_server.exe` by physically rewriting `"requestFeedback": false` in `.metadata.json` across `PreToolUse`, `PostToolUse`, and asynchronous post-write watchers, stripping the redundant blue `Proceed` (`Ctrl+Enter`) button while preserving the clean clickable plan card.
 - <b>Subagent Passthrough</b>: Automatically identifies delegated subagents via `transcript.jsonl` lineage inspection, granting friction-free execution to child agents once the primary agent secures approval.
 - <b>Zero External Dependencies</b>: Single-file vanilla Node.js implementation (`guard.cjs`) with zero npm dependencies and sub-millisecond evaluation latency.
 

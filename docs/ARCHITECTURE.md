@@ -62,10 +62,10 @@ graph TD
    - `ask_question` 为回合内阻塞式工具（调用即刻挂起当前回合并渲染选项弹窗）；而 `write_file(implementation_plan.md)` 为毫秒级非阻塞调用，返回 `"Created file."` 后模型仍处于当前推理回合内。
    - 宿主前端在 `write_file` 调用瞬间<b>不会立即渲染大卡片</b>，而是将其暂存于当前回合队列中；<b>仅当模型彻底停止调用后续工具、主动结束当前回合（Yield Turn）的那一瞬间</b>，前端才会在该回合消息气泡底部挂载可点击的 `Implementation Plan` 大卡片。
    - 因此，当同一回合内先后调用 `write_file(implementation_plan.md)` 与 `ask_question` 时，在等待用户点击 `ask_question` 期间大卡片尚未挂载（此时可通过正文中的 `[implementation_plan.md](file:///...)` 链接芯片点击展开右侧分栏预览），待用户回答完毕且该回合结束时，大卡片即刻挂载落位。
-3. <b>蓝色「继续 `Ctrl+↵`」按钮的激活态显隐规则（与 `RequestFeedback` 无关）</b>：
-   - 实测证明，无论 `ArtifactMetadata.RequestFeedback` 设为 `true` 还是 `false`，只要本轮写入了 `UserFacing: true` 的 `implementation_plan.md`，大卡片右下角的蓝色「继续 `Ctrl+↵`」按钮显隐均由<b>该消息是否处于聊天流最底部激活态</b>唯一决定：
-     - <b>激活态（显示按钮）</b>：当挂载了 `Implementation Plan` 大卡片的回复气泡处于整个聊天窗口的<b>最底部最后一条消息</b>时（例如主智能体派发后台子智能体 `1 subagent running` 并暂停自身回合等待子智能体返回的 1~3 分钟窗口期内），卡片右下角会显示蓝色「继续 `Ctrl+↵`」按钮；
-     - <b>历史态（自动隐藏按钮，沉淀为纯净大卡片）</b>：一旦子智能体执行完毕、主智能体在下方输出最终验收总结，或用户在多方案回合后开启了新一轮对话，原消息气泡不再处于聊天窗口最底部，前端便会<b>自动销毁隐藏该卡片右下角的蓝色「继续 `Ctrl+↵`」按钮</b>，仅保留干净、宽大且可随时点击展开的 `Implementation Plan` 历史大卡片。
+3. <b>Go `proto3` 零值忽略陷阱与 `.metadata.json` 钩子级按钮物理剥离机制</b>：
+   - <b>底层根因（Go `proto3` 零值特性）</b>：在 `language_server.exe` 二进制中，`ArtifactMetadata.RequestFeedback` 定义为 `protobuf:"varint,6,opt,name=request_feedback,json=requestFeedback,proto3" json:"request_feedback,omitempty"`。由于 Go `proto3` 将布尔值 `false` 视为默认零值（未设置），一旦磁盘上的 `implementation_plan.md.metadata.json` 存在 `"requestFeedback": true`，模型在调用 `write_file` 时传入 `RequestFeedback: false` 会被后端忽略，导致前端卡片右下角一直渲染蓝色「继续 `Ctrl+↵`」按钮；
+   - <b>三阶物理覆写（`stripArtifactFeedbackButton`）</b>：`guard.cjs` 在 `PreToolUse`（写盘前预清理）、异步多阶守护进程（写盘后 `80ms / 250ms / 600ms`）与 `PostToolUse`（写盘完成回调）三道关卡直接通过 `fs.writeFileSync` 将 `<file>.metadata.json` 中的 `"requestFeedback"` 强制覆写为 `false`；
+   - <b>无按钮纯净大卡片效果</b>：当磁盘 `.metadata.json` 被锁死为 `"requestFeedback": false` 后，即使该消息气泡处于聊天窗口最底部最新激活态，前端也<b>仅渲染宽大、可点击展开的 `Implementation Plan` 纯净大卡片，彻底剥离右下角的蓝色「继续 `Ctrl+↵`」按钮</b>。
 4. <b>点击 `Proceed` 后的底层日志报文结构</b>：
    - 若用户直接点击「继续 `Ctrl+↵`」按钮，宿主向 `transcript.jsonl` 追加一条 `source: "USER_EXPLICIT", type: "USER_INPUT"` 记录，固定载荷格式为：
      ```text

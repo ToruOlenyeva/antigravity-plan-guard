@@ -298,8 +298,10 @@ function handlePreToolUse(payload) {
 
     // 阶段 3：方案工件与调试目录放行（兼容全模型写盘工具名与参数名）
     if (WRITE_FILE_TOOLS.has(toolName)) {
-      const targetFile = extractTargetFileFromArgs(args).replace(/\\/g, "/");
+      const rawTarget = extractTargetFileFromArgs(args);
+      const targetFile = rawTarget.replace(/\\/g, "/");
       if (isWhitelistedTarget(targetFile)) {
+        stripArtifactFeedbackButton(rawTarget, true);
         return reply({ decision: "allow" });
       }
     }
@@ -535,6 +537,51 @@ function handlePreToolUse(payload) {
   }
 }
 
+function stripArtifactFeedbackFileSync(metaPath) {
+  try {
+    if (!metaPath || !fs.existsSync(metaPath)) return;
+    const raw = fs.readFileSync(metaPath, "utf8");
+    const data = JSON.parse(raw);
+    if (data && data.requestFeedback !== false) {
+      data.requestFeedback = false;
+      fs.writeFileSync(metaPath, JSON.stringify(data, null, 2) + "\n", "utf8");
+    }
+  } catch (e) {}
+}
+
+function stripArtifactFeedbackButton(targetFile, spawnFollowUp) {
+  try {
+    if (!targetFile) return;
+    const norm = path.normalize(String(targetFile));
+    const metaPath = norm.endsWith(".metadata.json") ? norm : norm + ".metadata.json";
+    stripArtifactFeedbackFileSync(metaPath);
+    if (spawnFollowUp) {
+      const { spawn } = require("child_process");
+      const child = spawn(
+        process.execPath,
+        [__filename, "strip-meta", metaPath],
+        { detached: true, stdio: "ignore", windowsHide: true }
+      );
+      child.unref();
+    }
+  } catch (e) {}
+}
+
+function handlePostToolUse(payload) {
+  try {
+    const toolCall = payload.toolCall || {};
+    const toolName = toolCall.name || "";
+    const args = toolCall.args || {};
+    if (WRITE_FILE_TOOLS.has(toolName)) {
+      const rawTarget = extractTargetFileFromArgs(args);
+      if (isWhitelistedTarget(rawTarget)) {
+        stripArtifactFeedbackButton(rawTarget, false);
+      }
+    }
+  } catch (e) {}
+  return reply({});
+}
+
 function handlePreInvocation() {
   return reply({
     injectSteps: [{
@@ -545,10 +592,20 @@ function handlePreInvocation() {
 
 async function main() {
   const mode = process.argv[2] || "pre-tool";
+  if (mode === "strip-meta") {
+    const metaPath = process.argv[3];
+    stripArtifactFeedbackFileSync(metaPath);
+    for (const delay of [80, 250, 600]) {
+      await new Promise((r) => setTimeout(r, delay));
+      stripArtifactFeedbackFileSync(metaPath);
+    }
+    process.exit(0);
+  }
   const raw = await readStdin();
   let payload = {};
   try { if (raw.trim()) payload = JSON.parse(raw); } catch (e) {}
   if (mode === "pre-invocation") handlePreInvocation(payload);
+  else if (mode === "post-tool") handlePostToolUse(payload);
   else handlePreToolUse(payload);
 }
 
