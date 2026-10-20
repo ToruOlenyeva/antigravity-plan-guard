@@ -26,6 +26,7 @@
 - <b>Same-Turn Explanation Enforcement</b>: Compels the primary agent to output a complete root-cause and architectural explanation in the chat body within the exact same turn as calling the `ask_question` modal.
 - <b>Buttonless Clean `Implementation Plan` Card Guard</b>: Bypasses the Go `proto3` zero-value omission quirk in `language_server.exe` by physically rewriting `"requestFeedback": false` in `.metadata.json` across `PreToolUse`, `PostToolUse`, and asynchronous post-write watchers, stripping the redundant blue `Proceed` (`Ctrl+Enter`) button while preserving the clean clickable plan card.
 - <b>Subagent Passthrough</b>: Automatically identifies delegated subagents via `transcript.jsonl` lineage inspection, granting friction-free execution to child agents once the primary agent secures approval.
+- <b>Auto Language Detection for Chinese & English Users</b>: Automatically detects user dialog language (via latest user message in `transcript.jsonl` or system locale fallback) to deliver localized prompt instructions and action buttons (Chinese: "`确认执行 / 暂不修改`" vs English: "`Confirm & Execute / Cancel`").
 - <b>Zero External Dependencies</b>: Single-file vanilla Node.js implementation (`guard.cjs`) with zero npm dependencies and sub-millisecond evaluation latency.
 
 ---

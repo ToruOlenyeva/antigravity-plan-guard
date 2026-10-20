@@ -4,6 +4,39 @@ const path = require("path");
 
 const APPROVED_WINDOW_MS = 60000;
 
+function detectUserLang(transcriptPath) {
+  if (transcriptPath) {
+    try {
+      let tPath = transcriptPath;
+      if (tPath.endsWith("transcript_full.jsonl")) {
+        const compact = tPath.replace("transcript_full.jsonl", "transcript.jsonl");
+        if (fs.existsSync(compact)) tPath = compact;
+      }
+      if (fs.existsSync(tPath)) {
+        const fd = fs.openSync(tPath, "r");
+        const stats = fs.fstatSync(fd);
+        const readSize = Math.min(stats.size, 1048576);
+        const buffer = Buffer.alloc(readSize);
+        fs.readSync(fd, buffer, 0, readSize, Math.max(0, stats.size - readSize));
+        fs.closeSync(fd);
+        const lines = buffer.toString("utf-8").trim().split("\n");
+        for (let i = lines.length - 1; i >= 0; i--) {
+          try {
+            const e = JSON.parse(lines[i]);
+            if (e.source === "USER_EXPLICIT" || e.type === "USER_INPUT") {
+              const text = String(e.content || "");
+              if (/[\u4e00-\u9fff]/.test(text)) return "zh";
+              if (/[a-zA-Z]/.test(text)) return "en";
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
+  const sysLocale = (process.env.LANG || process.env.LC_ALL || Intl.DateTimeFormat().resolvedOptions().locale || "").toLowerCase();
+  return sysLocale.startsWith("zh") ? "zh" : "en";
+}
+
 function getStatePath(transcriptPath) {
   if (transcriptPath) {
     try {
@@ -272,7 +305,7 @@ function evaluateAskQuestionResponse(content, presetOptions) {
   }
   if (answerLines.length === 0) return { isAskResponse: false };
 
-  const rejectSignals = /(先等下|慢着|等等|暂停|别动|不要动|停下|先别|不要改|先不改|暂不|取消|拒绝|仅讨论|先看更多细节)/;
+  const rejectSignals = /(先等下|慢着|等等|暂停|别动|不要动|停下|先别|不要改|先不改|暂不|取消|拒绝|仅讨论|先看更多细节|^cancel$|^reject$|^no$|^stop$)/i;
 
   for (const ans of answerLines) {
     if (!ans || /^(skipped|canceled|cancelled)$/i.test(ans)) {
@@ -315,6 +348,7 @@ function isReadOnlySubagentCall(args) {
 
 function handlePreToolUse(payload) {
   try {
+    const userLang = detectUserLang(payload.transcriptPath);
     const toolCall = payload.toolCall || {};
     const toolName = toolCall.name || "";
     const args = toolCall.args || {};
@@ -365,7 +399,9 @@ function handlePreToolUse(payload) {
       }
       return reply({
         decision: "deny",
-        reason: "【方案门禁拦截】未检测到会话授权记录。请在同一回合先输出聊天正文解释（content），再调用 ask_question 在提问窗口中列出纯修改方案征得用户按钮确认后再执行修改。"
+        reason: userLang === "zh"
+          ? "【方案门禁拦截】未检测到会话授权记录。请在同一回合先输出聊天正文解释（content），再调用 ask_question 在提问窗口中列出纯修改方案征得用户按钮确认后再执行修改。"
+          : "[Plan Guard Intercept] No session approval record detected. Please first output chat explanation (content) in the same turn, then call ask_question to list the pure modification plan in the question modal for user button confirmation before making changes."
       });
     }
 
@@ -516,7 +552,9 @@ function handlePreToolUse(payload) {
       if (toolName === "ask_question") {
         return reply({
           decision: "deny",
-          reason: "【子智能体免弹窗直通】当前会话是由主智能体（Parent Agent）委派的子智能体，主智能体在派单前已取得用户按钮确认！子智能体严禁调用 ask_question 阻塞等待用户输入，请直接按主智能体下发的施工图并发执行文件读写与终端命令。"
+          reason: userLang === "zh"
+            ? "【子智能体免弹窗直通】当前会话是由主智能体（Parent Agent）委派的子智能体，主智能体在派单前已取得用户按钮确认！子智能体严禁调用 ask_question 阻塞等待用户输入，请直接按主智能体下发的施工图并发执行文件读写与终端命令。"
+            : "[Subagent Direct Execution] This conversation is a subagent delegated by the Parent Agent, which has already obtained user button confirmation! Subagents are STRICTLY FORBIDDEN from calling ask_question to block execution. Directly execute file operations and terminal commands concurrently per the plan."
         });
       }
       return reply({ decision: "allow" });
@@ -527,19 +565,44 @@ function handlePreToolUse(payload) {
       if ((currentAskStepFound && !currentAskStepHasContent) || (!currentAskStepFound && !hasAssistantContentSinceLastReset)) {
         return reply({
           decision: "deny",
-          reason: "【方案门禁拦截 · 严禁无正文裸调弹窗】检测到你在调用 ask_question 的当前回合未输出任何聊天正文解释（content 字段为空），导致用户只能看到干巴巴的修改弹窗而看不到原因分析与解释！请在同一回合中先在聊天正文（content）输出完整的分析与解释说明，再同时调用 ask_question（question 窗口仅列纯修改方案与文件芯片）。"
+          reason: userLang === "zh"
+            ? "【方案门禁拦截 · 严禁无正文裸调弹窗】检测到你在调用 ask_question 的当前回合未输出任何聊天正文解释（content 字段为空），导致用户只能看到干巴巴的修改弹窗而看不到原因分析与解释！请在同一回合中先在聊天正文（content）输出完整的分析与解释说明，再同时调用 ask_question（question 窗口仅列纯修改方案与文件芯片）。"
+            : "[Plan Guard Intercept | Empty Content Forbidden] Calling ask_question with empty chat content is blocked! The user must see the rationale and analysis in chat before the popup. Please output full explanations in chat body (content) first in the same turn, and simultaneously call ask_question (keep question window focused on modification plan and file chips)."
         });
       }
       const qs = parseToolArg(args.questions);
       if (Array.isArray(qs)) {
-        const lazyRefRegex = /(详见正文|详见方案|见正文|见方案|见上文|如上所述|详见上方|参考正文|参考上文|详见\s*implementation_plan)/i;
+        const lazyRefRegex = /(详见正文|见正文|如上所述|见上方|详见上方|同正文|方案见正文|详见方案|见方案|见上文|参考正文|参考上文|详见\s*implementation_plan|see above|see chat|as described above|refer to above|see details above|same as above)/i;
         for (const q of qs) {
           const qText = String((q && q.question) || "");
           if (lazyRefRegex.test(qText)) {
             return reply({
               decision: "deny",
-              reason: "【方案门禁拦截 · 严禁折叠藏匿与冗余指代】严禁在 question 中写「详见正文/详见方案/详见 implementation_plan.md」！请在同一回合先输出聊天正文（content）解释，并将【纯修改方案（待修改的 [文件名](file:///...) 芯片及具体改动点）】直接写在 ask_question 的 question 窗口中，options 选项只放极简动作按钮（如「(Recommended) 确认执行」「采用方案 A」「暂不修改」，严禁在 options 中重复抄写方案），然后重新调用 ask_question。"
+              reason: userLang === "zh"
+                ? "【方案门禁拦截 · 严禁折叠藏匿与冗余指代】严禁在 question 中写「详见正文/详见方案/详见 implementation_plan.md」等占位词！请在同一回合先输出聊天正文（content）解释，并将【纯修改方案（待修改的 [文件名](file:///...) 芯片及具体改动点）】直接写在 ask_question 的 question 窗口中，options 选项只放极简动作按钮（如「(Recommended) 确认执行」「采用方案 A」「暂不修改」，严禁在 options 中重复抄写方案），然后重新调用 ask_question。"
+                : "[Plan Guard Intercept | Lazy References Forbidden] Using placeholders like 'see above / refer to plan / see implementation_plan.md' in question is forbidden! Output analysis in chat body (content) first, and put the pure modification plan (target [filename](file:///...) chips and specific changes) directly in the ask_question modal. Keep options strictly to concise action buttons (e.g., '(Recommended) Confirm & Execute', 'Cancel'; never duplicate plan text in options), then call ask_question again."
             });
+          }
+          if (Array.isArray(q && q.options)) {
+            if (q.options.length < 2) {
+              return reply({
+                decision: "deny",
+                reason: userLang === "zh"
+                  ? "【方案门禁拦截 · 选项数量不足】ask_question 的 options 必须至少提供 2 个可选项（例如单方案：[\"(Recommended) 确认执行\", \"暂不修改\"]；多方案：[\"(Recommended) 采用方案 A\", \"采用方案 B\", \"暂不修改\"]）。"
+                  : "[Plan Guard Intercept | Insufficient Options] The options in ask_question must provide at least 2 selectable choices (e.g., single option: [\"(Recommended) Confirm & Execute\", \"Cancel\"]; multiple options: [\"(Recommended) Option A\", \"Option B\", \"Cancel\"])."
+              });
+            }
+            for (const opt of q.options) {
+              const optText = String(opt || "").trim();
+              if (optText.length > 40) {
+                return reply({
+                  decision: "deny",
+                  reason: userLang === "zh"
+                    ? "【方案门禁拦截 · 选项过长】检测到 options 文本长度超过 40 字符（\"" + optText.slice(0, 30) + "...\"）。options 仅作为极简确认按钮（如「(Recommended) 确认执行」「暂不修改」），严禁在 options 中重复抄写方案或长句解释！"
+                    : "[Plan Guard Intercept | Option Too Long] Detected option text exceeding 40 characters (\"" + optText.slice(0, 30) + "...\"). Keep options strictly as concise action buttons (e.g., '(Recommended) Confirm & Execute', 'Cancel'); do NOT duplicate plan text or long explanations in options!"
+                });
+              }
+            }
           }
         }
       }
@@ -558,7 +621,9 @@ function handlePreToolUse(payload) {
     if (lastResetReason === "write_in") {
       return reply({
         decision: "deny",
-        reason: "【方案门禁拦截 · Write-In 提示词补充】检测到用户在 ask_question 中自行输入了文字（Write-In），这属于提示词补充而非确认！请先在同一回合的聊天正文（content）中回应用户的补充要求并说明调整原因，同时再次调用 ask_question（在 question 窗口中直接列出更新后的纯修改方案，options 只放极简确认按钮）供用户确认。"
+        reason: userLang === "zh"
+          ? "【方案门禁拦截 · Write-In 提示词补充】检测到用户在 ask_question 中自行输入了文字（Write-In），这属于提示词补充而非确认！请先在同一回合的聊天正文（content）中回应用户的补充要求并说明调整原因，同时再次调用 ask_question（在 question 窗口中直接列出更新后的纯修改方案，options 只放极简确认按钮）供用户确认。"
+          : "[Plan Guard Intercept | Write-In Prompt Refinement] User input custom text (Write-In) in ask_question, which represents prompt refinement rather than confirmation! Please address the user feedback and rationale in chat content first, and call ask_question again (list updated pure modification plan in question, concise buttons in options) for user confirmation."
       });
     }
 
@@ -566,20 +631,36 @@ function handlePreToolUse(payload) {
     if (hasPlanSinceLastReset) {
       return reply({
         decision: "deny",
-        reason: "【方案门禁拦截 · 等待按钮确认】已生成 implementation_plan.md 大卡片，但尚未通过 ask_question 征得用户按钮确认！请在同一回合先输出聊天正文解释（content），并同时调用 ask_question 弹出确认面板：在 question 窗口中直接列出核心修改方案与目标业务文件芯片（严禁塞入原理解释，严禁写「详见正文/详见 implementation_plan.md」），options 仅放极简动作按钮（如「(Recommended) 确认执行」「暂不修改」，严禁复读方案），等待用户勾选提交后再执行修改。"
+        reason: userLang === "zh"
+          ? "【方案门禁拦截 · 等待按钮确认】已生成 implementation_plan.md 大卡片，但尚未通过 ask_question 征得用户按钮确认！请在同一回合先输出聊天正文解释（content），并同时调用 ask_question 弹出确认面板：在 question 窗口中直接列出核心修改方案与目标业务文件芯片（严禁塞入原理解释，严禁写「详见正文/详见 implementation_plan.md」），options 仅放极简动作按钮（如「(Recommended) 确认执行」「暂不修改」，严禁复读方案），等待用户勾选提交后再执行修改。"
+          : "[Plan Guard Intercept | Awaiting Button Confirmation] implementation_plan.md artifact generated, but user button confirmation via ask_question has not been obtained! In the same turn, output explanations in chat content first, and call ask_question to present the confirmation modal: list core modification plan and target business file chips in question directly (no rationale dumping, no 'see above'), keep options as concise action buttons (e.g., '(Recommended) Confirm & Execute', 'Cancel'), and wait for user submission before modifying."
       });
     }
 
     // 分支 4：尚未调用 ask_question 确认 -> 阻断并引导模型按分级策略调用 ask_question
     let actionDesc = "状态修改或代码写盘操作";
-    if (toolName === "run_command" || toolName === "Bash") actionDesc = "具有环境或服务修改副作用的终端命令";
-    else if (toolName === "invoke_subagent" || toolName === "Task") actionDesc = "派发写盘/执行类子智能体";
-    else if (toolName.indexOf("mcp") !== -1) actionDesc = "具有外部写入或修改副作用的 MCP 工具";
-    else if (toolName === "manage_task") actionDesc = "具有控制副作用的后台进程操作";
+    let actionDescEn = "state mutation or file writing";
+    if (toolName === "run_command" || toolName === "Bash") {
+      actionDesc = "具有环境或服务修改副作用的终端命令";
+      actionDescEn = "terminal commands with environmental/service side effects";
+    } else if (toolName === "invoke_subagent" || toolName === "Task") {
+      actionDesc = "派发写盘/执行类子智能体";
+      actionDescEn = "dispatching mutating subagents";
+    } else if (toolName.indexOf("mcp") !== -1) {
+      actionDesc = "具有外部写入或修改副作用的 MCP 工具";
+      actionDescEn = "MCP tools with external modification side effects";
+    } else if (toolName === "manage_task") {
+      actionDesc = "具有控制副作用的后台进程操作";
+      actionDescEn = "background task management with control side effects";
+    }
+
+    const zhReason = "【方案门禁拦截 · 零信任白名单】检测到尚未通过按钮确认即尝试执行" + actionDesc + "（工具：" + toolName + "）。请按任务复杂度分级触发 ask_question 按钮确认（严禁无正文裸调弹窗，严禁让用户手动打字回复「确认」，严禁不写方案只写「详见正文/详见方案」）：1) 同回合先正文解释再弹窗：调用 ask_question 的同一回合必须先在聊天正文（content）输出完整的原因分析与原理解释，ask_question 的 question 窗口直接列出【纯修改方案（待修改的 [文件名](file:///...) 芯片及具体改动点）】；2) 简单任务（≤3文件）免写 implementation_plan.md（不弹大卡片），复杂任务（>3文件或多方案架构）先写 implementation_plan.md（可在 question 标题旁附带 [implementation_plan.md](file:///...) 芯片供弹窗期点击预览，且回合结束后底部自动挂载 Implementation Plan 大卡片）；3) 选项零复读：options 仅放极简动作按钮（单方案用「(Recommended) 确认执行 / 暂不修改」，多方案用「(Recommended) 采用方案 A / 采用方案 B / 暂不修改」），严禁在 options 中重复抄写方案内容！";
+
+    const enReason = "[Plan Guard Intercept | Zero-Trust Whitelist] Attempted " + actionDescEn + " (tool: " + toolName + ") before user button confirmation! Trigger ask_question button confirmation graded by complexity (no empty-content popups, no asking user to type 'confirm' manually, no lazy 'see above' references): 1) Chat explanation before popup in same turn: output full analysis and rationale in chat content first, list pure modification plan and target [filename](file:///...) chips directly in ask_question modal; 2) Skip implementation_plan.md for simple tasks (<=3 files); generate implementation_plan.md for complex tasks (>3 files) and attach [implementation_plan.md](file:///...) chip in question; 3) Zero-duplication options: keep options strictly to concise action buttons (single option: [\"(Recommended) Confirm & Execute\", \"Cancel\"]; multiple options: [\"(Recommended) Option A\", \"Option B\", \"Cancel\"]); never copy plan text into options!";
 
     return reply({
       decision: "deny",
-      reason: "【方案门禁拦截 · 零信任白名单】检测到尚未通过按钮确认即尝试执行" + actionDesc + "（工具：" + toolName + "）。请按任务复杂度分级触发 ask_question 按钮确认（严禁无正文裸调弹窗，严禁让用户手动打字回复「确认」，严禁不写方案只写「详见正文/详见方案」）：1) 同回合先正文解释再弹窗：调用 ask_question 的同一回合必须先在聊天正文（content）输出完整的原因分析与原理解释，ask_question 的 question 窗口直接列出【纯修改方案（待修改的 [文件名](file:///...) 芯片及具体改动点）】；2) 简单任务（≤3文件）免写 implementation_plan.md（不弹大卡片），复杂任务（>3文件或多方案架构）先写 implementation_plan.md（可在 question 标题旁附带 [implementation_plan.md](file:///...) 芯片供弹窗期点击预览，且回合结束后底部自动挂载 Implementation Plan 大卡片）；3) 选项零复读：options 仅放极简动作按钮（单方案用「(Recommended) 确认执行 / 暂不修改」，多方案用「(Recommended) 采用方案 A / 采用方案 B / 暂不修改」），严禁在 options 中重复抄写方案内容！"
+      reason: userLang === "zh" ? zhReason : enReason
     });
   } catch (e) {
     return reply({ decision: "allow" });
@@ -634,14 +715,25 @@ function handlePostToolUse(payload) {
       state.approvedAt = Date.now();
       saveState(statePath, state);
     }
+    if (toolName === "ask_question" && state.approved) {
+      const userLang = detectUserLang(payload.transcriptPath);
+      const zhMsg = "【方案已获用户确认批准】用户已通过按钮确认方案。请在 60 秒有效期内以最高效率并发完成代码落盘与自测核销。";
+      const enMsg = "[Plan Approved by User] User confirmed execution via button. Within the 60-second window, proceed efficiently to complete code modifications and verifications concurrently.";
+      return reply({
+        injectSteps: [{ ephemeralMessage: userLang === "zh" ? zhMsg : enMsg }]
+      });
+    }
   } catch (e) {}
   return reply({});
 }
 
-function handlePreInvocation() {
+function handlePreInvocation(payload) {
+  const userLang = detectUserLang(payload && payload.transcriptPath);
+  const zhMessage = "【方案门禁在线（主智能体单点确认 · 子智能体免弹窗直通）】1) 若当前会话是由主智能体通过 invoke_subagent 委派的子智能体（Subagent，即收到 <SYSTEM_MESSAGE> [Message] ... sender=... 指令），主智能体在派单前已完成用户确认，子智能体【严禁调用 ask_question 弹窗阻塞】，必须直接按施工图并发执行文件读写与终端验证！2) 若当前会话为直接面向用户的【主智能体（Main Agent）】，执行任何代码/文档修改或派发写盘子智能体前，必须通过 ask_question 弹出按钮卡片暂停确认，并遵守三项 UI 铁律：a) 同回合先正文解释再弹窗（调用 ask_question 的同一回合必须在聊天正文 content 中先输出完整的原因分析与解释说明，严禁无正文裸调弹窗；question 窗口直接列出【纯修改方案】与目标业务文件 [文件名](file:///...) 芯片；简单任务免写 implementation_plan.md 不弹大卡片，复杂任务先写 implementation_plan.md 并在 question 标题旁附 [implementation_plan.md](file:///...) 芯片供弹窗期预览，回合结束时底部自动挂载 Implementation Plan 大卡片，严禁不写方案只写「详见正文/方案」）；b) 选项只做极简按钮（单方案：[\"(Recommended) 确认执行\", \"暂不修改\"]；多方案：[\"(Recommended) 采用方案 A\", \"采用方案 B\", \"暂不修改\"]，严禁在 options 中重复抄写方案）；c) Write-In 自定义输入视为提示词补充，须在聊天正文回应并调整方案后再次调用 ask_question 确认！";
+  const enMessage = "[Plan Guard Online (Main Agent Single-Point Confirmation | Subagents Bypass)] 1) If the current conversation is a subagent delegated by the main agent via invoke_subagent (received <SYSTEM_MESSAGE> [Message] ... sender=... instruction), the main agent has already obtained user confirmation. Subagents are STRICTLY FORBIDDEN from calling ask_question to block for user input; proceed directly with concurrent file operations and terminal verifications per the plan! 2) If the current conversation is the user-facing Main Agent, before executing any code/document mutations or dispatching mutating subagents, you MUST call ask_question to pause for button confirmation, adhering to three UI rules: a) Provide chat body explanation before popup in the same turn (always output full analysis and rationale in chat content first; never call ask_question with empty content. Place pure modification plan and target [filename](file:///...) chips directly in the question window. Skip implementation_plan.md for simple tasks <=3 files; write implementation_plan.md for complex tasks >3 files and include [implementation_plan.md](file:///...) chip in question. Never say 'see above/refer to plan'); b) Use concise action options only (single option: [\"(Recommended) Confirm & Execute\", \"Cancel\"]; multiple options: [\"(Recommended) Option A\", \"Option B\", \"Cancel\"]; never duplicate plan details in options); c) Treat custom write-in input as prompt refinement; address it in chat content and call ask_question again for approval!";
   return reply({
     injectSteps: [{
-      ephemeralMessage: "【方案门禁在线（主智能体单点确认 · 子智能体免弹窗直通）】1) 若当前会话是由主智能体通过 invoke_subagent 委派的子智能体（Subagent，即收到 <SYSTEM_MESSAGE> [Message] ... sender=... 指令），主智能体在派单前已完成用户确认，子智能体【严禁调用 ask_question 弹窗阻塞】，必须直接按施工图并发执行文件读写与终端验证！2) 若当前会话为直接面向用户的【主智能体（Main Agent）】，执行任何代码/文档修改或派发写盘子智能体前，必须通过 ask_question 弹出按钮卡片暂停确认，并遵守三项 UI 铁律：a) 同回合先正文解释再弹窗（调用 ask_question 的同一回合必须在聊天正文 content 中先输出完整的原因分析与解释说明，严禁无正文裸调弹窗；question 窗口直接列出【纯修改方案】与目标业务文件 [文件名](file:///...) 芯片；简单任务免写 implementation_plan.md 不弹大卡片，复杂任务先写 implementation_plan.md 并在 question 标题旁附 [implementation_plan.md](file:///...) 芯片供弹窗期预览，回合结束时底部自动挂载 Implementation Plan 大卡片，严禁不写方案只写「详见正文/方案」）；b) 选项只做极简按钮（单方案：[\"(Recommended) 确认执行\", \"暂不修改\"]；多方案：[\"(Recommended) 采用方案 A\", \"采用方案 B\", \"暂不修改\"]，严禁在 options 中重复抄写方案）；c) Write-In 自定义输入视为提示词补充，须在聊天正文回应并调整方案后再次调用 ask_question 确认！"
+      ephemeralMessage: userLang === "zh" ? zhMessage : enMessage
     }]
   });
 }
