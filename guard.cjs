@@ -528,7 +528,7 @@ function handlePreToolUse(payload) {
 
     return reply({
       decision: "deny",
-      reason: "【方案门禁拦截 · 零信任白名单】检测到尚未通过按钮确认即尝试执行" + actionDesc + "（工具：" + toolName + "）。请按任务复杂度分级触发 ask_question 按钮确认（严禁无正文裸调弹窗，严禁让用户手动打字回复「确认」，严禁写「详见正文/详见 implementation_plan.md」）：1) 同回合先正文解释再弹窗：调用 ask_question 的同一回合必须先在聊天正文（content）输出完整的原因分析与原理解释，ask_question 的 question 窗口只写【纯修改方案（待修改的 [文件名](file:///...) 芯片及具体改动点）】；2) 简单任务（≤3文件）免写 implementation_plan.md（不弹大卡片），复杂任务（>3文件或多方案架构）先写 implementation_plan.md（回合结束后自动挂载 Implementation Plan 大卡片，严禁在文本中写「详见 implementation_plan.md」）；3) 选项零复读：options 仅放极简动作按钮（单方案用「(Recommended) 确认执行 / 暂不修改」，多方案用「(Recommended) 采用方案 A / 采用方案 B / 暂不修改」），严禁在 options 中重复抄写方案内容！"
+      reason: "【方案门禁拦截 · 零信任白名单】检测到尚未通过按钮确认即尝试执行" + actionDesc + "（工具：" + toolName + "）。请按任务复杂度分级触发 ask_question 按钮确认（严禁无正文裸调弹窗，严禁让用户手动打字回复「确认」，严禁不写方案只写「详见正文/详见方案」）：1) 同回合先正文解释再弹窗：调用 ask_question 的同一回合必须先在聊天正文（content）输出完整的原因分析与原理解释，ask_question 的 question 窗口直接列出【纯修改方案（待修改的 [文件名](file:///...) 芯片及具体改动点）】；2) 简单任务（≤3文件）免写 implementation_plan.md（不弹大卡片），复杂任务（>3文件或多方案架构）先写 implementation_plan.md（可在 question 标题旁附带 [implementation_plan.md](file:///...) 芯片供弹窗期点击预览，且回合结束后底部自动挂载 Implementation Plan 大卡片）；3) 选项零复读：options 仅放极简动作按钮（单方案用「(Recommended) 确认执行 / 暂不修改」，多方案用「(Recommended) 采用方案 A / 采用方案 B / 暂不修改」），严禁在 options 中重复抄写方案内容！"
     });
   } catch (e) {
     return reply({ decision: "allow" });
@@ -538,7 +538,7 @@ function handlePreToolUse(payload) {
 function handlePreInvocation() {
   return reply({
     injectSteps: [{
-      ephemeralMessage: "【方案门禁在线（主智能体单点确认 · 子智能体免弹窗直通）】1) 若当前会话是由主智能体通过 invoke_subagent 委派的子智能体（Subagent，即收到 <SYSTEM_MESSAGE> [Message] ... sender=... 指令），主智能体在派单前已完成用户确认，子智能体【严禁调用 ask_question 弹窗阻塞】，必须直接按施工图并发执行文件读写与终端验证！2) 若当前会话为直接面向用户的【主智能体（Main Agent）】，执行任何代码/文档修改或派发写盘子智能体前，必须通过 ask_question 弹出按钮卡片暂停确认，并遵守三项 UI 铁律：a) 同回合先正文解释再弹窗（调用 ask_question 的同一回合必须在聊天正文 content 中先输出完整的原因分析与解释说明，严禁无正文裸调弹窗；question 窗口只写【纯修改方案】与目标业务文件 [文件名](file:///...) 芯片；简单任务免写 implementation_plan.md 不弹大卡片，复杂任务先写 implementation_plan.md 自动挂载 Implementation Plan 大卡片，严禁在任何地方写「详见正文/详见 implementation_plan.md」）；b) 选项只做极简按钮（单方案：[\"(Recommended) 确认执行\", \"暂不修改\"]；多方案：[\"(Recommended) 采用方案 A\", \"采用方案 B\", \"暂不修改\"]，严禁在 options 中重复抄写方案）；c) Write-In 自定义输入视为提示词补充，须在聊天正文回应并调整方案后再次调用 ask_question 确认！"
+      ephemeralMessage: "【方案门禁在线（主智能体单点确认 · 子智能体免弹窗直通）】1) 若当前会话是由主智能体通过 invoke_subagent 委派的子智能体（Subagent，即收到 <SYSTEM_MESSAGE> [Message] ... sender=... 指令），主智能体在派单前已完成用户确认，子智能体【严禁调用 ask_question 弹窗阻塞】，必须直接按施工图并发执行文件读写与终端验证！2) 若当前会话为直接面向用户的【主智能体（Main Agent）】，执行任何代码/文档修改或派发写盘子智能体前，必须通过 ask_question 弹出按钮卡片暂停确认，并遵守三项 UI 铁律：a) 同回合先正文解释再弹窗（调用 ask_question 的同一回合必须在聊天正文 content 中先输出完整的原因分析与解释说明，严禁无正文裸调弹窗；question 窗口直接列出【纯修改方案】与目标业务文件 [文件名](file:///...) 芯片；简单任务免写 implementation_plan.md 不弹大卡片，复杂任务先写 implementation_plan.md 并在 question 标题旁附 [implementation_plan.md](file:///...) 芯片供弹窗期预览，回合结束时底部自动挂载 Implementation Plan 大卡片，严禁不写方案只写「详见正文/方案」）；b) 选项只做极简按钮（单方案：[\"(Recommended) 确认执行\", \"暂不修改\"]；多方案：[\"(Recommended) 采用方案 A\", \"采用方案 B\", \"暂不修改\"]，严禁在 options 中重复抄写方案）；c) Write-In 自定义输入视为提示词补充，须在聊天正文回应并调整方案后再次调用 ask_question 确认！"
     }]
   });
 }
