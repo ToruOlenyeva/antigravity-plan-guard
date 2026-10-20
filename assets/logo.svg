@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="pg-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#062419"/>
+      <stop offset="100%" stop-color="#0f3728"/>
+    </linearGradient>
+    <linearGradient id="pg-shield" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="50%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#047857"/>
+    </linearGradient>
+    <linearGradient id="pg-doc" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#ecfdf5"/>
+    </linearGradient>
+    <filter id="pg-glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#10b981" flood-opacity="0.45"/>
+    </filter>
+    <filter id="pg-shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="3" stdDeviation="4" flood-color="#000000" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+  <!-- Background Card -->
+  <rect x="24" y="24" width="208" height="208" rx="44" fill="url(#pg-bg)" stroke="#10b981" stroke-width="3" stroke-opacity="0.4"/>
+  <!-- Decorative Accent Dots -->
+  <circle cx="56" cy="56" r="3" fill="#34d399" opacity="0.4"/>
+  <circle cx="72" cy="56" r="3" fill="#34d399" opacity="0.2"/>
+  <circle cx="56" cy="72" r="3" fill="#34d399" opacity="0.2"/>
+  <circle cx="200" cy="200" r="3" fill="#34d399" opacity="0.4"/>
+  <circle cx="184" cy="200" r="3" fill="#34d399" opacity="0.2"/>
+  <circle cx="200" cy="184" r="3" fill="#34d399" opacity="0.2"/>
+  <!-- Guardian Shield -->
+  <g filter="url(#pg-glow)">
+    <path d="M128 54 C158 54 188 64 192 76 C192 126 166 172 128 200 C90 172 64 126 64 76 C68 64 98 54 128 54 Z" fill="url(#pg-shield)"/>
+    <!-- Inner Shield Border -->
+    <path d="M128 62 C154 62 180 71 184 81 C184 123 162 163 128 188 C94 163 72 123 72 81 C76 71 102 62 128 62 Z" fill="none" stroke="#6ee7b7" stroke-width="2" opacity="0.6"/>
+  </g>
+  <!-- Plan Document -->
+  <g filter="url(#pg-shadow)">
+    <path d="M102 84 h34 l20 20 v52 a6 6 0 0 1 -6 6 h-48 a6 6 0 0 1 -6 -6 v-66 a6 6 0 0 1 6 -6 Z" fill="url(#pg-doc)"/>
+    <path d="M136 84 v15 a5 5 0 0 0 5 5 h15 Z" fill="#d1fae5"/>
+    <!-- Plan Lines -->
+    <line x1="108" y1="108" x2="128" y2="108" stroke="#10b981" stroke-width="2.5" stroke-linecap="round"/>
+    <line x1="108" y1="118" x2="148" y2="118" stroke="#059669" stroke-width="2.5" stroke-linecap="round" opacity="0.7"/>
+    <line x1="108" y1="128" x2="136" y2="128" stroke="#059669" stroke-width="2.5" stroke-linecap="round" opacity="0.7"/>
+  </g>
+  <!-- Approved Checkmark Badge -->
+  <g filter="url(#pg-shadow)">
+    <circle cx="146" cy="148" r="18" fill="#10b981" stroke="#ffffff" stroke-width="2.5"/>
+    <path d="M138 148 l6 6 l11 -11" fill="none" stroke="#ffffff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

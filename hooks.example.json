@@ -1,0 +1,23 @@
+{
+  "plan-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node guard.cjs pre-tool",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node guard.cjs pre-invocation",
+        "timeout": 10
+      }
+    ]
+  }
+}
