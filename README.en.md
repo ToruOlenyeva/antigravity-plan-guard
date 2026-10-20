@@ -1,129 +1,112 @@
-<p align="center">
-  <img src="assets/logo.svg" alt="Plan Guard Logo" width="64" height="64" />
-</p>
+[English](README.en.md) | [简体中文](README.md)
 
-<h1 align="center">Antigravity Plan Guard</h1>
+<div align="center">
+  <img src="assets/logo.svg" alt="Plan Guard Logo" width="72" height="72" />
+  <h1>Antigravity Plan Guard</h1>
+  <p>
+    <b>Plan-First Zero-Trust Gatekeeper Plugin for Google Antigravity 2.0</b><br>
+    Intercepts unauthorized file writes and side-effect commands, compelling the primary agent to conduct plan reviews via <code>ask_question</code>.
+  </p>
+  <p>
+    <a href="https://antigravity.google/"><img src="https://img.shields.io/badge/Google%20Antigravity%202.0-Plugin-4285F4?style=flat-square&logo=google&logoColor=white" alt="Google Antigravity 2.0 Plugin" /></a>
+    <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%3E%3D%2018-339933?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node.js" /></a>
+    <a href="docs/ARCHITECTURE.en.md"><img src="https://img.shields.io/badge/Dependencies-Zero-brightgreen?style=flat-square" alt="Zero Dependencies" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-orange?style=flat-square" alt="MIT License" /></a>
+    <a href="https://github.com/ToruOlenyeva/antigravity-plan-guard/stargazers"><img src="https://img.shields.io/github/stars/ToruOlenyeva/antigravity-plan-guard?style=flat-square&logo=github" alt="GitHub Stars" /></a>
+  </p>
+</div>
 
-<p align="center">
-  <b>Google Antigravity 2.0 Plan-First Zero-Trust Gatekeeper Plugin</b><br>
-  Intercepts unauthorized file writes and side-effect commands, compelling the primary agent to conduct plan reviews via <code>ask_question</code>.
-</p>
-
-<p align="center">
-  <a href="https://github.com/ToruOlenyeva/antigravity-plan-guard/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
-  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg" alt="Node Version"></a>
-  <a href="https://github.com/ToruOlenyeva/antigravity-plan-guard/stargazers"><img src="https://img.shields.io/github/stars/ToruOlenyeva/antigravity-plan-guard.svg" alt="GitHub Stars"></a>
-  <a href="README.md"><img src="https://img.shields.io/badge/README-中文-blue" alt="Chinese README"></a>
-</p>
-
----
-
-## 📖 Table of Contents
-
-- [Core Features](#-core-features)
-- [Installation and Deployment](#-installation-and-deployment)
-- [Usage Scenarios](#-usage-scenarios)
-- [Interception Workflow](#-interception-workflow)
-- [Whitelisting and Rules](#-whitelisting-and-rules)
-- [Architecture and Advanced Docs](#-architecture-and-advanced-docs)
-- [License](#-license)
+> <b>Stop unauthorized code mutations and duplicate confirmation prompts</b>: Purpose-built for <b>Google Antigravity 2.0</b> (the parallel multi-agent desktop client). Solves the critical issue where LLMs overwrite source files without approval or trigger duplicate native `Proceed` and `ask_question` prompts when writing `implementation_plan.md` artifacts, enforcing a deterministic zero-trust state machine at the `PreToolUse` / `PostToolUse` hook layer.
 
 ---
 
-## 🌟 Core Features
+## ✨ Key Features
 
-- <b>Zero-Trust Defense</b>: Rigorous monitoring at the `PreToolUse` lifecycle stage. All file modifications and side-effect terminal commands are intercepted prior to explicit user confirmation.
-- <b>Plan-First Prompt Injection</b>: Dynamically analyzes incomplete tasks via `PreInvocation` hooks and injects alignment directives into the agent context, preventing hasty coding.
-- <b>Interactive Confirmation Loop</b>: Compels the agent to present proposals and trigger interactive modal dialogs via `ask_question`. The gate automatically clears once confirmed.
-- <b>Subagent Passthrough</b>: Transparently identifies read-only subagents and controlled sessions to prevent redundant dialog friction while preserving defense integrity.
-- <b>Zero External Dependencies</b>: Built entirely on vanilla Node.js with zero npm dependencies, ultra-fast cold start, and sub-millisecond evaluation latency.
-
----
-
-## 🚀 Installation and Deployment
-
-### 1. Global Plugin Installation (Recommended)
-
-Clone the repository into your Antigravity global plugin directory:
-
-```bash
-cd ~/.gemini/config/plugins
-git clone https://github.com/ToruOlenyeva/antigravity-plan-guard.git plan-guard
-```
-
-### 2. Workspace Installation
-
-Ideal for repository-scoped security policies or isolated workspaces:
-
-```bash
-cd /path/to/your/workspace
-git clone https://github.com/ToruOlenyeva/antigravity-plan-guard.git .gemini/plugins/plan-guard
-```
-
-### 3. Activation
-
-Copy the sample hook configuration:
-
-```bash
-cd plan-guard
-cp hooks.example.json hooks.json
-```
-
-If utilizing a plugin manager such as `plugin-switcher`, toggle it directly in the UI.
+- <b>Zero-Trust Write Interception</b>: Strictly monitors the `PreToolUse` lifecycle. All source code writes, file edits, and side-effect terminal commands are blocked prior to explicit user approval, returning structured remediation directives to the model.
+- <b>Same-Turn Explanation Enforcement</b>: Compels the primary agent to output a complete root-cause and architectural explanation in the chat body within the exact same turn as calling the `ask_question` modal.
+- <b>Native `Proceed` Duplicate Suppression</b>: Automatically intercepts `ArtifactMetadata.RequestFeedback: true` when writing plan artifacts, eliminating redundant native `Proceed` review bars alongside `ask_question` modals.
+- <b>Subagent Passthrough</b>: Automatically identifies delegated subagents via `transcript.jsonl` lineage inspection, granting friction-free execution to child agents once the primary agent secures approval.
+- <b>Zero External Dependencies</b>: Single-file vanilla Node.js implementation (`guard.cjs`) with zero npm dependencies and sub-millisecond evaluation latency.
 
 ---
 
-## 💡 Usage Scenarios
-
-### Scenario 1: Read-Only Research & Inquiries
-
-When the agent uses `read_file`, searches code, or performs web lookups, Plan Guard permits immediate execution without friction.
-
-### Scenario 2: Code Refactoring & Disk Writes
-
-When the agent attempts `write_file`, `edit_file`, or mutative bash executions:
-1. The gatekeeper blocks the attempt and provides structured guidance.
-2. The agent explains the proposed diff in the chat body and triggers an `ask_question` confirmation dialog.
-3. Upon approval, the security state machine unlocks the operation and permits file modification.
-
-### Scenario 3: Autonomous Subagent Orchestration
-
-When the primary agent delegates tasks to read-only subagents, passthrough is granted automatically. For mutating subtasks, the primary agent secures approval beforehand.
-
----
-
-## 🔄 Interception Workflow
+## 🔄 Core Workflow
 
 ```mermaid
 flowchart TD
-    A["Agent Triggers Tool Call (PreToolUse)"] --> B{"Is Target a Protected Write/Mutation Tool?"}
-    B -- No (Read-Only) --> C["Allow Immediately (allow)"]
-    B -- Yes --> D{"Has Valid Plan Approval Token?"}
-    D -- Yes --> E["Consume Token and Allow (allow)"]
-    D -- No --> F["Intercept and Deny Call (deny)"]
-    F --> G["Instruct Agent to Present Plan and Call ask_question"]
+    A["Agent Triggers Tool Call (PreToolUse)"] --> B{"Is Target a Protected Write / Side-Effect Tool?"}
+    B -- "No (Read-Only Tool)" --> C["Allow Silently (allow)"]
+    B -- "Write implementation_plan.md Artifact" --> D["Enforce RequestFeedback: false & Allow"]
+    B -- "Write Source File / Side-Effect Command" --> E{"Is Delegated Subagent or Holds Valid Approval?"}
+    E -- "Yes (Approved / Subagent)" --> F["Allow Execution (allow)"]
+    E -- "No (Unauthorized Mutation)" --> G["Intercept & Block Call (deny)"]
+    G --> H["Compel Primary Agent to Explain in Chat Body & Call ask_question"]
 ```
 
 ---
 
-## ⚙️ Whitelisting and Rules
+## 🚀 Quick Installation
 
-Configured inside `hooks/pre-tool-use-guard.js`:
+Built with native Node.js and <b>Zero Dependencies</b>. Clone and run immediately without executing <code>npm install</code>.
 
-- <b>Protected Tools</b>: `write_file`, `edit_file`, `replace_file_content`, mutating `run_command`
-- <b>Approval Token</b>: Issued upon positive user confirmation through `ask_question`.
+### 1. Clone into Antigravity Plugins Directory
 
-For custom rule definitions, refer to [Architecture Specification](docs/ARCHITECTURE.en.md).
+<b>macOS / Linux</b>:
+```bash
+git clone https://github.com/ToruOlenyeva/antigravity-plan-guard.git ~/.gemini/config/plugins/plan-guard
+cp ~/.gemini/config/plugins/plan-guard/hooks.example.json ~/.gemini/config/plugins/plan-guard/hooks.json
+```
+
+<b>Windows (PowerShell)</b>:
+```powershell
+git clone https://github.com/ToruOlenyeva/antigravity-plan-guard.git "$env:USERPROFILE\.gemini\config\plugins\plan-guard"
+Copy-Item "$env:USERPROFILE\.gemini\config\plugins\plan-guard\hooks.example.json" "$env:USERPROFILE\.gemini\config\plugins\plan-guard\hooks.json"
+```
+
+<b>Windows (CMD)</b>:
+```cmd
+git clone https://github.com/ToruOlenyeva/antigravity-plan-guard.git %USERPROFILE%\.gemini\config\plugins\plan-guard
+copy %USERPROFILE%\.gemini\config\plugins\plan-guard\hooks.example.json %USERPROFILE%\.gemini\config\plugins\plan-guard\hooks.json
+```
+
+### 2. Enable and Launch
+
+After cloning and generating `hooks.json` (replace `<ABSOLUTE_PATH_TO_PLUGINS>` in `hooks.json` with your actual plugins directory path), restart Google Antigravity or toggle the plugin directly in `plugin-switcher`.
 
 ---
 
-## 📚 Architecture and Advanced Docs
+## 📖 Usage Guide
 
-- [System Architecture Specification (English)](docs/ARCHITECTURE.en.md)
-- [Chinese Documentation (README.md)](README.md)
+### 1. Read-Only Research & Code Inspection
+When the agent executes `read_file`, searches codebases, or runs read-only terminal verification commands (such as `git status`, `tsc --noEmit`, or `cargo check`), Plan Guard allows execution silently with zero friction.
+
+### 2. Code Refactoring & Multi-Option Plan Approval
+When the agent intends to modify source files or execute mutating commands:
+- The primary agent explains the root cause and design rationale in the chat response while rendering an `ask_question` confirmation modal.
+- Select the recommended confirmation button for single-plan execution, or pick between `Option A` and `Option B` when multiple architectural trade-offs are presented.
+- Submitting custom Write-In feedback automatically resets the approval state, ensuring the agent revises its plan and re-confirms before touching disk.
+
+### 3. Autonomous Subagent Orchestration
+Once you approve a plan on the primary agent and it delegates batch implementation via `invoke_subagent`, child subagents automatically bypass interactive prompts to execute concurrent file writes and test suites at full speed.
+
+---
+
+## 📚 Documentation Matrix
+
+| Module | Description & Technical Details | Link |
+| :--- | :--- | :--- |
+| <b>System Architecture</b> | Three-phase gate model, state machine transitions, native `Proceed` button mechanics, and JSON contracts | [View Architecture](docs/ARCHITECTURE.en.md) |
+| <b>Example Hook Configuration</b> | Standard `PreToolUse` and `PostToolUse` lifecycle hook registration template | [View Example Config](hooks.example.json) |
+
+---
+
+## 🤝 Contributors & Credits
+
+- <b>[Toru Olenyeva](https://github.com/ToruOlenyeva)</b>
+- <b>[Google Antigravity](https://antigravity.google/)</b>
 
 ---
 
 ## 📄 License
 
-Distributed under the [MIT License](LICENSE).
+This project is licensed under the [<b>MIT License</b>](LICENSE).

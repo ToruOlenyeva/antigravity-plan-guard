@@ -1,130 +1,112 @@
-<p align="center">
-  <img src="assets/logo.svg" alt="Plan Guard Logo" width="64" height="64" />
-</p>
+[English](README.en.md) | [简体中文](README.md)
 
-<h1 align="center">Antigravity Plan Guard</h1>
+<div align="center">
+  <img src="assets/logo.svg" alt="Plan Guard Logo" width="72" height="72" />
+  <h1>Antigravity Plan Guard</h1>
+  <p>
+    <b>Google Antigravity 2.0 方案先行零信任门禁系统</b><br>
+    拦截擅自写盘与副作用命令，倒逼主智能体通过 <code>ask_question</code> 进行方案预审与卡点对齐。
+  </p>
+  <p>
+    <a href="https://antigravity.google/"><img src="https://img.shields.io/badge/Google%20Antigravity%202.0-Plugin-4285F4?style=flat-square&logo=google&logoColor=white" alt="Google Antigravity 2.0 Plugin" /></a>
+    <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/Node.js-%3E%3D%2018-339933?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node.js" /></a>
+    <a href="docs/ARCHITECTURE.md"><img src="https://img.shields.io/badge/Dependencies-Zero-brightgreen?style=flat-square" alt="Zero Dependencies" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-orange?style=flat-square" alt="MIT License" /></a>
+    <a href="https://github.com/ToruOlenyeva/antigravity-plan-guard/stargazers"><img src="https://img.shields.io/github/stars/ToruOlenyeva/antigravity-plan-guard?style=flat-square&logo=github" alt="GitHub Stars" /></a>
+  </p>
+</div>
 
-<p align="center">
-  <b>Google Antigravity 2.0 方案先行零信任门禁系统</b><br>
-  拦截擅自写盘与副作用命令，倒逼主智能体通过 <code>ask_question</code> 进行方案预审与卡点对齐。
-</p>
-
-<p align="center">
-  <a href="https://github.com/ToruOlenyeva/antigravity-plan-guard/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
-  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%3E%3D18.0.0-brightgreen.svg" alt="Node Version"></a>
-  <a href="https://github.com/ToruOlenyeva/antigravity-plan-guard/stargazers"><img src="https://img.shields.io/github/stars/ToruOlenyeva/antigravity-plan-guard.svg" alt="GitHub Stars"></a>
-  <a href="README.en.md"><img src="https://img.shields.io/badge/README-English-blue" alt="English README"></a>
-</p>
-
----
-
-## 📖 目录
-
-- [核心特性](#-核心特性)
-- [三端安装与部署指南](#-三端安装与部署指南)
-- [分场景使用指南](#-分场景使用指南)
-- [拦截工作流原理](#-拦截工作流原理)
-- [白名单与放行规则配置](#-白名单与放行规则配置)
-- [深入架构与进阶文档](#-深入架构与进阶文档)
-- [开源许可证](#-开源许可证)
+> <b>终结 AI 擅自改代码与无效弹窗干扰</b>：专为 <b>Google Antigravity 2.0</b>（并行多智能体桌面客户端）打造。针对大模型在复杂任务中未经确认直接覆写源码、或在输出 `implementation_plan.md` 工件时重复弹出原生 `Proceed` 与 `ask_question` 双重确认框的痛点，在 `PreToolUse` / `PostToolUse` 底层构建零信任确定性状态机门禁。
 
 ---
 
-## 🌟 核心特性
+## ✨ 核心特性
 
-- <b>零信任防御拦截</b>：严格监控 `PreToolUse` 生命周期。所有写盘、覆盖及副作用终端命令在未经确认前均被硬阻断并回掷重试提示。
-- <b>方案先行卡点注入</b>：通过 `PreInvocation` 钩子解析当前任务进度，若存在未完成任务则强制向智能体上下文注入方案卡点提醒，阻止冒进编码。
-- <b>交互式确认闭环</b>：智能体必须调用 `ask_question` 渲染交互弹窗并获得确认；门禁系统在识别到确认状态后自动开闸放行。
-- <b>子智能体免打扰直通</b>：自动识别只读子会话与受控子智能体，在保障隔离的前提下豁免冗余交互，兼顾极致安全与高效吞吐。
-- <b>零外部依赖轻量设计</b>：纯原生 Node.js 实现，无第三方包依赖，极速冷启动，亚毫秒级拦截判定。
-
----
-
-## 🚀 三端安装与部署指南
-
-### 1. 全局插件安装（推荐）
-
-将本仓库克隆至 Antigravity 全局插件目录：
-
-```bash
-cd ~/.gemini/config/plugins
-git clone https://github.com/ToruOlenyeva/antigravity-plan-guard.git plan-guard
-```
-
-### 2. 局部工作区安装
-
-适用于特定工程或安全敏感代码库的独立门禁控制：
-
-```bash
-cd /path/to/your/workspace
-git clone https://github.com/ToruOlenyeva/antigravity-plan-guard.git .gemini/plugins/plan-guard
-```
-
-### 3. 配置激活
-
-从示例配置文件复制并生成运行配置：
-
-```bash
-cd plan-guard
-cp hooks.example.json hooks.json
-```
-
-若使用的是 Antigravity 插件管理器（如 `plugin-switcher`），亦可通过界面直接勾选启用。
+- <b>零信任写盘硬拦截</b>：严格监控 `PreToolUse` 生命周期，所有代码写盘、文件覆盖及具有副作用的终端命令在未获用户确认前均被硬阻断，并向模型回传结构化引导指令。
+- <b>同回合正文解释强约束</b>：强制要求主智能体在调用 `ask_question` 弹窗的同一回合内先在聊天正文输出完整原因分析，弹窗内仅展示纯修改方案与可点击文件芯片。
+- <b>原生 `Proceed` 双弹窗消重</b>：自动拦截工件写入时的 `ArtifactMetadata.RequestFeedback: true`，消除底部原生 `Proceed` 审查条与 `ask_question` 弹窗的重复打扰。
+- <b>子智能体免打扰直通</b>：通过会话 `transcript.jsonl` 溯源自动识别由主智能体委派的子智能体（Subagent），主智能体单点确认后子智能体直接高速并发落盘，零二次弹窗阻塞。
+- <b>零外部依赖轻量设计</b>：单文件纯原生 Node.js 实现（`guard.cjs`），零第三方 npm 包依赖，亚毫秒级状态机裁决。
 
 ---
 
-## 💡 分场景使用指南
-
-### 场景一：日常只读咨询与调研
-
-智能体执行 `read_file`、搜索代码库或调用 `search_web` 时，门禁全程静默放行，无感知、零阻碍。
-
-### 场景二：代码重构与写盘修改
-
-当智能体试图调用 `write_file`、`edit_file` 或执行写操作命令时：
-1. 门禁系统阻断该调用并返回结构化指导提示。
-2. 智能体根据反馈在对话正文阐明方案，同时调用 `ask_question` 弹出双选弹窗。
-3. 用户点击确认后，门禁状态机转为已核准，后续写盘调用顺利放行。
-
-### 场景三：多智能体并发协作
-
-主智能体派发只读子智能体进行大规模调研时，子智能体自动直通；若派发写入任务，由主智能体先行完成方案锁定，子智能体聚焦高速执行。
-
----
-
-## 🔄 拦截工作流原理
+## 🔄 核心工作流原理
 
 ```mermaid
 flowchart TD
-    A["智能体发起工具调用 (PreToolUse)"] --> B{"是否为受保护写盘/副作用工具?"}
-    B -- 否 (只读工具) --> C["直接放行 (allow)"]
-    B -- 是 --> D{"是否持有有效方案确认放行凭证?"}
-    D -- 是 --> E["核销放行 (allow)"]
-    D -- 否 --> F["拦截并中断调用 (deny)"]
-    F --> G["提示智能体输出方案并调用 ask_question 确认"]
+    A["智能体发起工具调用 (PreToolUse)"] --> B{"是否为受保护写盘 / 副作用工具?"}
+    B -- "否 (只读检索工具)" --> C["直接静默放行 (allow)"]
+    B -- "写 implementation_plan.md 工件" --> D["校验 RequestFeedback: false 防双弹窗后放行"]
+    B -- "写业务源码 / 副作用命令" --> E{"是否为子智能体或已持有 ask_question 批准凭证?"}
+    E -- "是 (已获批 / 子会话直通)" --> F["放行执行 (allow)"]
+    E -- "否 (未获批擅自修改)" --> G["硬阻断拦截 (deny)"]
+    G --> H["倒逼主智能体同回合输出正文解释并调用 ask_question 确认"]
 ```
 
 ---
 
-## ⚙️ 白名单与放行规则配置
+## 🚀 快速安装
 
-插件通过 `hooks/pre-tool-use-guard.js` 维护工具判定规则：
+本项目采用纯原生 Node.js 构建，<b>零外部依赖（Zero Dependencies）</b>，克隆即可运行，无需执行 <code>npm install</code>。
 
-- <b>保护工具列表</b>：`write_file`, `edit_file`, `replace_file_content`, `run_command`（写模式）
-- <b>放行凭证机制</b>：用户在 `ask_question` 选择确认项后激活单次或批次放行会话。
+### 1. 克隆插件至 Antigravity 插件目录
 
-如需调整特定安全命令白名单，可查阅 [深入架构文档](docs/ARCHITECTURE.md)。
+<b>macOS / Linux</b>:
+```bash
+git clone https://github.com/ToruOlenyeva/antigravity-plan-guard.git ~/.gemini/config/plugins/plan-guard
+cp ~/.gemini/config/plugins/plan-guard/hooks.example.json ~/.gemini/config/plugins/plan-guard/hooks.json
+```
+
+<b>Windows (PowerShell)</b>:
+```powershell
+git clone https://github.com/ToruOlenyeva/antigravity-plan-guard.git "$env:USERPROFILE\.gemini\config\plugins\plan-guard"
+Copy-Item "$env:USERPROFILE\.gemini\config\plugins\plan-guard\hooks.example.json" "$env:USERPROFILE\.gemini\config\plugins\plan-guard\hooks.json"
+```
+
+<b>Windows (CMD)</b>:
+```cmd
+git clone https://github.com/ToruOlenyeva/antigravity-plan-guard.git %USERPROFILE%\.gemini\config\plugins\plan-guard
+copy %USERPROFILE%\.gemini\config\plugins\plan-guard\hooks.example.json %USERPROFILE%\.gemini\config\plugins\plan-guard\hooks.json
+```
+
+### 2. 生效与启动
+
+克隆并生成 `hooks.json`（请将模板中的 `<ABSOLUTE_PATH_TO_PLUGINS>` 替换为你的实际插件目录绝对路径）后，重启 Google Antigravity 或通过 `plugin-switcher` 面板一键启用即可生效。
 
 ---
 
-## 📚 深入架构与进阶文档
+## 📖 使用方法指南
 
-- [系统详细架构文档 (中文)](docs/ARCHITECTURE.md)
-- [System Architecture Specification (English)](docs/ARCHITECTURE.en.md)
-- [双语英文说明 (README.en.md)](README.en.md)
+### 1. 日常只读咨询与代码检索
+当智能体执行 `read_file`、搜索代码、查看状态或执行只读终端检查命令（如 `git status`、`tsc --noEmit`、`cargo check`）时，门禁全程静默放行，零弹窗打扰。
+
+### 2. 代码修改与多方案决策确认
+当智能体准备修改业务代码或执行写入命令时：
+- 主智能体会在聊天正文中详细说明问题根因与修改逻辑，同时弹出 `ask_question` 确认框。
+- 单方案场景直接点击 `确认执行` 即可开闸放行；多方案对比场景可直接点选 `采用方案 A` / `采用方案 B`。
+- 若你在弹窗底部输入框（Write-In）填写了补充意见，门禁会自动重置为待定状态，要求智能体根据你的补充意见调整方案后再次确认。
+
+### 3. 多智能体并发协作（Subagent Passthrough）
+当主智能体通过 `ask_question` 获得你的确认并调用 `invoke_subagent` 派发后台子智能体施工时，子智能体拥有免弹窗直通权限，可在后台直接高速完成多文件并发读写与测试验证。
 
 ---
 
-## 📄 开源许可证
+## 📚 官方技术文档中心
 
-本项目基于 [MIT 许可证](LICENSE) 开源。
+| 模块名称 | 说明与技术细节 | 链接 |
+| :--- | :--- | :--- |
+| <b>系统架构设计</b> | 三阶段门禁裁决模型、状态机转换、原生 `Proceed` 按钮触发机制与接口规范 | [查看架构文档](docs/ARCHITECTURE.md) |
+| <b>示例钩子配置</b> | 标准 `PreToolUse` 与 `PostToolUse` 生命周期钩子挂载配置模板 | [查看示例配置](hooks.example.json) |
+
+---
+
+## 🤝 贡献与共创团队
+
+- <b>[Toru Olenyeva](https://github.com/ToruOlenyeva)</b>
+- <b>[Google Antigravity](https://antigravity.google/)</b>
+
+---
+
+## 📄 开源协议
+
+本项目基于 [<b>MIT License</b>](LICENSE) 开源。
