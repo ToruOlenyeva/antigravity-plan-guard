@@ -3,8 +3,12 @@
   "displayName": "方案先行门禁 (Plan Guard)",
   "version": "1.0.0",
   "description": "Google Antigravity 2.0 方案先行零信任门禁系统：拦截写盘与副作用工具，强制要求在执行前通过 ask_question 获得用户确认，并动态注入当前未完成任务方案卡点",
-  "author": "Toru Olenyeva",
+  "author": {
+    "name": "Toru Olenyeva",
+    "url": "https://github.com/ToruOlenyeva"
+  },
   "repository": "https://github.com/ToruOlenyeva/antigravity-plan-guard",
+  "license": "MIT",
   "keywords": [
     "antigravity",
     "plan-first",
