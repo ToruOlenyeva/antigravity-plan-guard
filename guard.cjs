@@ -123,7 +123,7 @@ function isModelAgnosticReadOnlyTool(toolName, args = {}) {
 
   if (toolName === "call_mcp_tool") {
     const mcpTool = String(parseToolArg(args.ToolName) || "");
-    if (/^(get_|list_|search_|read_|view_|sequentialthinking$)/i.test(mcpTool) && !/(write|edit|replace|create|delete|remove|update|run|exec|kill|push|commit|send|merge|fork)/i.test(mcpTool)) {
+    if ((/^(get_|list_|search_|read_|view_|sequentialthinking$)/i.test(mcpTool) || /(^|_)(read|view|get|list|search|find|grep|fetch|inspect|check)(_|$)/i.test(mcpTool)) && !/(write|edit|replace|create|delete|remove|update|run|exec|kill|push|commit|send|merge|fork)/i.test(mcpTool)) {
       return true;
     }
     return false;
@@ -133,8 +133,8 @@ function isModelAgnosticReadOnlyTool(toolName, args = {}) {
     return false;
   }
 
-  // 语义词根兜底：凡以只读动词开头且不含任何写盘/执行/修改词根的工具，跨模型自动放行
-  if (/^(read|view|get|list|search|find|grep|fetch|inspect|check)_/i.test(toolName) && !/(write|edit|replace|create|delete|remove|update|run|exec|kill|push|commit|send|patch|modify)/i.test(toolName)) {
+  // 语义词根兜底：凡以只读动词开头（或带 mcp_<server>_ 前缀的 Eager MCP 只读工具）且不含任何写盘/执行/修改词根的工具，跨模型自动放行
+  if (/^(mcp_[\w-]+_)?(read|view|get|list|search|find|grep|fetch|inspect|check)(_|$)/i.test(toolName) && !/(write|edit|replace|create|delete|remove|update|run|exec|kill|push|commit|send|patch|modify)/i.test(toolName)) {
     return true;
   }
 
