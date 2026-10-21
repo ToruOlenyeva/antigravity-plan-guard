@@ -407,6 +407,16 @@ function handlePreToolUse(payload) {
 
     const fd = fs.openSync(tPath, "r");
     const stats = fs.fstatSync(fd);
+    let hasUserInputInHead = false;
+    if (stats.size > 1048576) {
+      const headSize = Math.min(stats.size, 65536);
+      const headBuf = Buffer.alloc(headSize);
+      fs.readSync(fd, headBuf, 0, headSize, 0);
+      const headStr = headBuf.toString("utf-8");
+      if (/"source"\s*:\s*"USER_EXPLICIT"|"type"\s*:\s*"USER_INPUT"/.test(headStr)) {
+        hasUserInputInHead = true;
+      }
+    }
     const readSize = Math.min(stats.size, 1048576);
     const buffer = Buffer.alloc(readSize);
     fs.readSync(fd, buffer, 0, readSize, Math.max(0, stats.size - readSize));
@@ -423,7 +433,7 @@ function handlePreToolUse(payload) {
     let lastResetReason = "initial";
     let pendingToolCalls = [];
     let pendingStepIndex = -1;
-    let hasUserInput = false;
+    let hasUserInput = hasUserInputInHead;
     let hasParentSenderMessage = false;
 
     for (let i = 0; i < lines.length; i++) {
