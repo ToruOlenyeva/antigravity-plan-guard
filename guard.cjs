@@ -1,8 +1,6 @@
-// Antigravity 全局方案审查门禁执行引擎 (plan-guard) · 交互按钮确认架构 (ask_question)
+// Antigravity 全局方案审查门禁执行引擎 (plan-guard) · 交互按钮确认架构 (ask_question) + 增量字节游标本轮全放开状态机
 const fs = require("fs");
 const path = require("path");
-
-const APPROVED_WINDOW_MS = 60000;
 
 function detectUserLang(transcriptPath) {
   if (transcriptPath) {
@@ -55,7 +53,7 @@ function loadState(statePath) {
       if (data && typeof data === "object") return data;
     }
   } catch (e) {}
-  return { approved: false, approvedAt: 0 };
+  return { approved: false, approvedStepIndex: -1, lastScannedOffset: 0 };
 }
 
 function saveState(statePath, state) {
@@ -380,11 +378,9 @@ function handlePreToolUse(payload) {
       }
     }
 
-    // 阶段 5：状态机扫描对话历史（区分主智能体与子智能体；主智能体统一通过 ask_question 按钮确认）
+    // 阶段 5：增量字节游标（lastScannedOffset）+ 精确审批步号（approvedStepIndex）状态机扫描
     const statePath = getStatePath(payload.transcriptPath);
     const state = loadState(statePath);
-    const now = Date.now();
-    const isStateWindowValid = Boolean(state.approved && (now - (state.approvedAt || 0) <= APPROVED_WINDOW_MS));
 
     let tPath = payload.transcriptPath || "";
     const fullPath = tPath.endsWith("transcript.jsonl")
@@ -418,15 +414,27 @@ function handlePreToolUse(payload) {
         hasUserInputInHead = true;
       }
     }
-    const readSize = Math.min(stats.size, 1048576);
+
+    const hasValidCursor = Boolean(
+      state.approved &&
+      typeof state.approvedStepIndex === "number" &&
+      state.approvedStepIndex >= 0 &&
+      typeof state.lastScannedOffset === "number" &&
+      state.lastScannedOffset > 0 &&
+      state.lastScannedOffset <= stats.size
+    );
+    const cursorDelta = hasValidCursor ? (stats.size - state.lastScannedOffset + 65536) : 0;
+    const readSize = Math.min(stats.size, Math.max(1048576, cursorDelta));
+    const readStart = Math.max(0, stats.size - readSize);
     const buffer = Buffer.alloc(readSize);
-    fs.readSync(fd, buffer, 0, readSize, Math.max(0, stats.size - readSize));
+    fs.readSync(fd, buffer, 0, readSize, readStart);
     fs.closeSync(fd);
 
     const chunk = buffer.toString("utf-8");
     const lines = chunk.trim().split("\n");
 
-    let isApproved = false;
+    let isApproved = Boolean(hasValidCursor && readStart <= state.lastScannedOffset);
+    let approvedStepIndex = isApproved ? state.approvedStepIndex : -1;
     let hasPlanSinceLastReset = false;
     let hasAssistantContentSinceLastReset = false;
     let currentAskStepFound = false;
@@ -441,9 +449,32 @@ function handlePreToolUse(payload) {
       try {
         const e = JSON.parse(lines[i]);
         const content = e.content || "";
+        const stepIdx = typeof e.step_index === "number" ? e.step_index : -1;
 
         if (e.source === "USER_EXPLICIT" || e.type === "USER_INPUT") {
           hasUserInput = true;
+        }
+        if (
+          (e.type === "SYSTEM_MESSAGE" || e.source === "SYSTEM") &&
+          /\[Message\]\s+timestamp=[^\r\n]+?\s+sender=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(content)
+        ) {
+          hasParentSenderMessage = true;
+        }
+
+        // 若当前处于增量游标已授权状态，且该行发生在 approvedStepIndex 之前或当时，不重复触发旧行撤权
+        if (isApproved && approvedStepIndex >= 0 && stepIdx >= 0 && stepIdx <= approvedStepIndex) {
+          continue;
+        }
+
+        // 熔断线 3：用户在界面手动点击 Stop / Cancel 中断执行 -> 立即撤权
+        if (e.status === "CANCELED" || e.status === "CANCELLED") {
+          isApproved = false;
+          approvedStepIndex = -1;
+          lastResetReason = "canceled";
+        }
+
+        // 熔断线 1：新用户消息输入 -> 除非明确包含直接授权词，否则立即撤权归零
+        if (e.source === "USER_EXPLICIT" || e.type === "USER_INPUT") {
           pendingToolCalls = [];
           pendingStepIndex = -1;
           hasPlanSinceLastReset = false;
@@ -452,13 +483,10 @@ function handlePreToolUse(payload) {
           currentAskStepHasContent = false;
           if (isUserAuthorized(content)) {
             isApproved = true;
-            state.approved = true;
-            state.approvedAt = now;
-            saveState(statePath, state);
+            approvedStepIndex = stepIdx;
           } else {
             isApproved = false;
-            state.approved = false;
-            saveState(statePath, state);
+            approvedStepIndex = -1;
             lastResetReason = "user_input";
           }
           continue;
@@ -467,11 +495,9 @@ function handlePreToolUse(payload) {
         if (e.type === "SYSTEM_MESSAGE" || e.source === "SYSTEM") {
           currentAskStepFound = false;
           currentAskStepHasContent = false;
-          if (/\[Message\]\s+timestamp=[^\r\n]+?\s+sender=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(content)) {
-            hasParentSenderMessage = true;
-          }
           if (isUserAuthorized(content)) {
             isApproved = true;
+            if (stepIdx >= 0) approvedStepIndex = stepIdx;
           }
           continue;
         }
@@ -483,11 +509,14 @@ function handlePreToolUse(payload) {
           }
           if (Array.isArray(e.tool_calls)) {
             pendingToolCalls = e.tool_calls;
-            pendingStepIndex = typeof e.step_index === "number" ? e.step_index : -1;
+            pendingStepIndex = stepIdx;
             const callsAsk = e.tool_calls.some((tc) => tc && tc.name === "ask_question");
             if (callsAsk) {
               currentAskStepFound = true;
               currentAskStepHasContent = visibleText.length > 0;
+              // 熔断线 2a：发起新的 ask_question 弹窗时，旧授权挂起等待新弹窗响应
+              isApproved = false;
+              approvedStepIndex = -1;
             }
             for (const tc of e.tool_calls) {
               if (tc && WRITE_FILE_TOOLS.has(tc.name) && tc.args) {
@@ -540,13 +569,11 @@ function handlePreToolUse(payload) {
             hasAssistantContentSinceLastReset = false;
             if (askEval.approved) {
               isApproved = true;
-              state.approved = true;
-              state.approvedAt = now;
-              saveState(statePath, state);
+              approvedStepIndex = stepIdx;
             } else {
+              // 熔断线 2b：Write-In 提示词补充、点击暂不修改或跳过 -> 立即撤权归零
               isApproved = false;
-              state.approved = false;
-              saveState(statePath, state);
+              approvedStepIndex = -1;
               lastResetReason = askEval.isWriteIn ? "write_in" : "ask_rejected";
             }
             pendingToolCalls = [];
@@ -556,6 +583,12 @@ function handlePreToolUse(payload) {
         }
       } catch (err) {}
     }
+
+    // 同步持久化最新增量字节游标与本轮授权状态
+    state.approved = isApproved;
+    state.approvedStepIndex = isApproved ? approvedStepIndex : -1;
+    state.lastScannedOffset = stats.size;
+    saveState(statePath, state);
 
     // 子智能体会话识别：无人类直接输入（USER_EXPLICIT）且由父智能体 SYSTEM_MESSAGE (sender=<UUID>) 唤醒
     const isSubagent = !hasUserInput && hasParentSenderMessage;
@@ -620,11 +653,8 @@ function handlePreToolUse(payload) {
       return reply({ decision: "allow" });
     }
 
-    // 分支 1：已通过 ask_question 预设选项点击或明确授权，或处于 60s 滑动续期窗口 -> 直接放行并刷新滑动窗口
-    if (isApproved || isStateWindowValid) {
-      state.approved = true;
-      state.approvedAt = now;
-      saveState(statePath, state);
+    // 分支 1：已通过 ask_question 预设选项点击或明确授权（增量字节游标确认本轮内无撤权事件）-> 直接放行
+    if (isApproved) {
       return reply({ decision: "allow" });
     }
 
@@ -719,18 +749,28 @@ function handlePostToolUse(payload) {
         stripArtifactFeedbackButton(rawTarget, false);
       }
     }
-    // 60s 滑动续期窗口：当非 ask_question 的受控工具或 call_mcp_tool 执行完毕且当前 state.approved 为 true 时刷新
+    // 增量字节游标刷新：当非 ask_question 的受控工具执行完毕且当前 state.approved 为 true 时，推进游标至最新 EOF
     const statePath = getStatePath(payload.transcriptPath);
     const state = loadState(statePath);
-    if (state.approved && toolName !== "ask_question") {
-      state.approvedAt = Date.now();
-      saveState(statePath, state);
+    if (state.approved && toolName !== "ask_question" && payload.transcriptPath) {
+      let tPath = payload.transcriptPath;
+      if (tPath.endsWith("transcript_full.jsonl")) {
+        const compact = tPath.replace("transcript_full.jsonl", "transcript.jsonl");
+        if (fs.existsSync(compact)) tPath = compact;
+      }
+      if (fs.existsSync(tPath)) {
+        state.lastScannedOffset = fs.statSync(tPath).size;
+        saveState(statePath, state);
+      }
     }
   } catch (e) {}
   return reply({});
 }
 
 function handlePreInvocation(payload) {
+  if (payload && payload.transcriptPath && hasRecentPlanApproval(payload.transcriptPath)) {
+    return reply({});
+  }
   const userLang = detectUserLang(payload && payload.transcriptPath);
   const zhMessage = "【方案门禁在线（主智能体单点确认 · 子智能体免弹窗直通）】1) 若当前会话是由主智能体通过 invoke_subagent 委派的子智能体（Subagent，即收到 <SYSTEM_MESSAGE> [Message] ... sender=... 指令），主智能体在派单前已完成用户确认，子智能体【严禁调用 ask_question 弹窗阻塞】，必须直接按施工图并发执行文件读写与终端验证！2) 若当前会话为直接面向用户的【主智能体（Main Agent）】，执行任何代码/文档修改或派发写盘子智能体前，必须通过 ask_question 弹出按钮卡片暂停确认，并遵守三项 UI 铁律：a) 同回合先正文解释再弹窗（调用 ask_question 的同一回合必须在聊天正文 content 中先输出完整的原因分析与解释说明，严禁无正文裸调弹窗；question 窗口直接列出【纯修改方案】与目标业务文件 [文件名](file:///...) 芯片；简单任务免写 implementation_plan.md 不弹大卡片，复杂任务先写 implementation_plan.md 并在 question 标题旁附 [implementation_plan.md](file:///...) 芯片供弹窗期预览，回合结束时底部自动挂载 Implementation Plan 大卡片，严禁不写方案只写「详见正文/方案」）；b) 选项只做极简按钮（单方案：[\"(Recommended) 确认执行\", \"暂不修改\"]；多方案：[\"(Recommended) 采用方案 A\", \"采用方案 B\", \"暂不修改\"]，严禁在 options 中重复抄写方案）；c) Write-In 自定义输入视为提示词补充，须在聊天正文回应并调整方案后再次调用 ask_question 确认！";
   const enMessage = "[Plan Guard Online (Main Agent Single-Point Confirmation | Subagents Bypass)] 1) If the current conversation is a subagent delegated by the main agent via invoke_subagent (received <SYSTEM_MESSAGE> [Message] ... sender=... instruction), the main agent has already obtained user confirmation. Subagents are STRICTLY FORBIDDEN from calling ask_question to block for user input; proceed directly with concurrent file operations and terminal verifications per the plan! 2) If the current conversation is the user-facing Main Agent, before executing any code/document mutations or dispatching mutating subagents, you MUST call ask_question to pause for button confirmation, adhering to three UI rules: a) Provide chat body explanation before popup in the same turn (always output full analysis and rationale in chat content first; never call ask_question with empty content. Place pure modification plan and target [filename](file:///...) chips directly in the question window. Skip implementation_plan.md for simple tasks <=3 files; write implementation_plan.md for complex tasks >3 files and include [implementation_plan.md](file:///...) chip in question. Never say 'see above/refer to plan'); b) Use concise action options only (single option: [\"(Recommended) Confirm & Execute\", \"Cancel\"]; multiple options: [\"(Recommended) Option A\", \"Option B\", \"Cancel\"]; never duplicate plan details in options); c) Treat custom write-in input as prompt refinement; address it in chat content and call ask_question again for approval!";
