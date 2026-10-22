@@ -196,26 +196,27 @@ function parseToolArg(val) {
 function isPureReadOnlyCommand(cmd) {
   if (!cmd) return false;
   const c = cmd.toLowerCase().replace(/[\r\n]/g, " ").trim();
+  const cNoStdErr = c.replace(/\b2>\s*\/dev\/null\b/g, "").replace(/\b2>&1\b/g, "");
 
-  // 1. 禁止任何管道或重定向写盘行为
-  if (c.indexOf(">") !== -1 || c.indexOf("out-file") !== -1 || c.indexOf("set-content") !== -1 || c.indexOf("add-content") !== -1) {
+  // 1. 禁止任何实质文件重定向或写盘行为（已豁免 2>/dev/null 与 2>&1）
+  if (cNoStdErr.indexOf(">") !== -1 || cNoStdErr.indexOf("out-file") !== -1 || cNoStdErr.indexOf("set-content") !== -1 || cNoStdErr.indexOf("add-content") !== -1) {
     return false;
   }
 
-  // 2. 远程 SSH 命令严格审计
-  if (c.indexOf("ssh ") !== -1) {
-    const remoteMutations = /(sed |tee |rm |mv |cp |docker |systemctl |service |apt |apt-get |yum |dnf |curl |wget |reboot |shutdown |chmod |chown |kill |mkdir |touch )/;
-    if (remoteMutations.test(c)) return false;
+  // 2. 远程 SSH 命令严格审计（拦截任何写盘/启停/变更子命令，放行纯只读巡检）
+  if (/^ssh(\s|$)/.test(c)) {
+    const remoteMutations = /\b(sed\s+-i|tee\b|rm\b|mv\b|cp\b|scp\b|rsync\b|systemctl\s+(start|stop|restart|reload|enable|disable|mask|unmask|daemon-reload|edit|set-property)|service\s+\S+\s+(start|stop|restart|reload)|docker\s+(run|rm|rmi|stop|start|restart|kill|pause|unpause|update|build|pull|push|commit|cp|create|network\s+create|network\s+rm|volume\s+create|volume\s+rm|compose\s+up|compose\s+down|compose\s+restart)|qm\s+(start|stop|reboot|reset|shutdown|suspend|resume|destroy|set|clone|migrate|rollback|snapshot|delonestop)|pct\s+(start|stop|reboot|shutdown|destroy|set)|apt\b|apt-get\b|dpkg\s+-(i|r|p|b)|opkg\s+(install|remove|upgrade)|yum\b|dnf\b|apk\s+(add|del)|curl\s+.*(-o|-O|-X\s*(POST|PUT|DELETE|PATCH)|--data|-d)|wget\b|reboot\b|shutdown\b|poweroff\b|init\b|chmod\b|chown\b|chgrp\b|kill\b|pkill\b|killall\b|mkdir\b|touch\b|ln\b|mount\b|umount\b|ufw\s+(enable|disable|allow|deny|delete|reset)|iptables\b|nft\b|crontab\s+-[er]|useradd\b|userdel\b|usermod\b|passwd\b|visudo\b|dd\b|mkfs\b|fdisk\b|parted\b)/i;
+    if (remoteMutations.test(cNoStdErr)) return false;
 
-    const pureRemoteReads = /^(ssh\s+[\s\S]+?["'])(cat|grep|ls|ps|head|tail|find|which|echo|uptime|top|free|df|stat)\b/;
-    if (pureRemoteReads.test(c)) return true;
+    const pureRemoteReads = /\b(cat|grep|egrep|fgrep|ls|ps|head|tail|find|which|whereis|type|echo|uptime|top|free|df|du|stat|uname|hostname|id|whoami|ip|ss|netstat|lsof|dpkg\s+-l|opkg\s+list-installed|docker\s+(ps|top|inspect|logs|stats|images|version|info|exec)|qm\s+(status|list|config|guest\s+exec)|pct\s+(status|list|config)|systemctl\s+(status|is-active|is-enabled|list-units|list-unit-files)|journalctl)\b/i;
+    if (pureRemoteReads.test(cNoStdErr)) return true;
 
     return false;
   }
 
   // 3. 本地纯只读查询命令白名单（支持 git -C <path> 前缀）
-  const localSafeReads = /^(git\s+(-C\s+("[^"]+"|'[^']+'|\S+)\s+)?(status|log|diff|branch|show)|dir|ls|get-childitem|cat|type|get-content|head|tail|grep|select-string|findstr|npm\s+run\s+test:docs|npm\s+test|cargo\s+check)(\s|$)/;
-  if (localSafeReads.test(c)) return true;
+  const localSafeReads = /^(git\s+(-c\s+("[^"]+"|'[^']+'|\S+)\s+)?(status|log|diff|branch|show)|dir|ls|get-childitem|cat|type|get-content|head|tail|grep|select-string|findstr|npm\s+run\s+test:docs|npm\s+test|cargo\s+check)(\s|$)/i;
+  if (localSafeReads.test(cNoStdErr)) return true;
 
   return false;
 }
