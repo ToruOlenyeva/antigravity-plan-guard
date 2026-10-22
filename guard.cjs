@@ -506,6 +506,7 @@ function syncTranscriptState(rawTranscriptPath) {
       if (isUserAuthorized(content)) {
         state.approved = true;
         state.approvedStepIndex = stepIdx;
+        state.lastResetReason = "";
       } else {
         state.approved = false;
         state.approvedStepIndex = -1;
