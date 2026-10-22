@@ -46,14 +46,34 @@ function getStatePath(transcriptPath) {
   return path.join(os.tmpdir(), "antigravity-plan-guard-state.json");
 }
 
+function createInitialState() {
+  return {
+    stateVersion: 2,
+    approved: false,
+    approvedStepIndex: -1,
+    lastScannedOffset: 0,
+    hasPlanSinceLastReset: false,
+    hasAssistantContentSinceLastReset: false,
+    currentAskStepFound: false,
+    currentAskStepHasContent: false,
+    lastResetReason: "initial",
+    pendingToolCalls: [],
+    pendingStepIndex: -1,
+    hasUserInput: false,
+    hasParentSenderMessage: false
+  };
+}
+
 function loadState(statePath) {
   try {
     if (statePath && fs.existsSync(statePath)) {
       const data = JSON.parse(fs.readFileSync(statePath, "utf8"));
-      if (data && typeof data === "object") return data;
+      if (data && typeof data === "object" && data.stateVersion === 2) {
+        return Object.assign(createInitialState(), data);
+      }
     }
   } catch (e) {}
-  return { approved: false, approvedStepIndex: -1, lastScannedOffset: 0 };
+  return createInitialState();
 }
 
 function saveState(statePath, state) {
@@ -271,14 +291,30 @@ function extractAskQuestionPresetOptions(toolCalls) {
   if (!Array.isArray(toolCalls)) return preset;
   for (const tc of toolCalls) {
     if (!tc || tc.name !== "ask_question" || !tc.args) continue;
-    const qs = parseToolArg(tc.args.questions);
-    if (!Array.isArray(qs)) continue;
-    for (const q of qs) {
-      if (q && Array.isArray(q.options)) {
-        for (const opt of q.options) {
-          if (typeof opt === "string" && opt.trim()) {
-            preset.add(opt.trim());
+    const rawQuestions = tc.args.questions;
+    const qs = parseToolArg(rawQuestions);
+    if (Array.isArray(qs)) {
+      for (const q of qs) {
+        if (q && Array.isArray(q.options)) {
+          for (const opt of q.options) {
+            if (typeof opt === "string" && opt.trim()) {
+              preset.add(opt.trim());
+            }
           }
+        }
+      }
+    } else if (typeof rawQuestions === "string" && rawQuestions.indexOf('"options"') !== -1) {
+      // 兼容 transcript.jsonl 字段超长截断导致 JSON.parse 失败的场景：正则抢救提取 options 数组
+      const optBlockRegex = /"options"\s*:\s*\[([\s\S]*?)(?:\]|$)/g;
+      let blockMatch;
+      while ((blockMatch = optBlockRegex.exec(rawQuestions)) !== null) {
+        const strRegex = /"((?:\\.|[^"\\])*)"/g;
+        let strMatch;
+        while ((strMatch = strRegex.exec(blockMatch[1])) !== null) {
+          try {
+            const decoded = JSON.parse(`"${strMatch[1]}"`).trim();
+            if (decoded) preset.add(decoded);
+          } catch (e) {}
         }
       }
     }
@@ -305,6 +341,7 @@ function evaluateAskQuestionResponse(content, presetOptions) {
   if (answerLines.length === 0) return { isAskResponse: false };
 
   const rejectSignals = /(先等下|慢着|等等|暂停|别动|不要动|停下|先别|不要改|先不改|暂不|取消|拒绝|仅讨论|先看更多细节|^cancel$|^reject$|^no$|^stop$)/i;
+  const standardApprovePreset = /^(\(Recommended\)\s*)?(确认执行|确认修改|同意并执行|确认|同意|采用|继续|confirm|approve|proceed|yes)$/i;
 
   for (const ans of answerLines) {
     if (!ans || /^(skipped|canceled|cancelled)$/i.test(ans)) {
@@ -313,12 +350,15 @@ function evaluateAskQuestionResponse(content, presetOptions) {
     if (rejectSignals.test(ans)) {
       return { isAskResponse: true, approved: false, isWriteIn: false };
     }
+    if (standardApprovePreset.test(ans) || ans.startsWith("(Recommended)")) {
+      continue;
+    }
     if (!presetOptions || presetOptions.size === 0) {
       return { isAskResponse: true, approved: false, isWriteIn: true };
     }
     if (!presetOptions.has(ans)) {
       const parts = ans.split(/\s*,\s*/).map((s) => s.trim()).filter(Boolean);
-      const allPartsInPreset = parts.length > 1 && parts.every((p) => presetOptions.has(p));
+      const allPartsInPreset = parts.length > 1 && parts.every((p) => presetOptions.has(p) || p.startsWith("(Recommended)"));
       if (!allPartsInPreset) {
         return { isAskResponse: true, approved: false, isWriteIn: true };
       }
@@ -345,12 +385,250 @@ function isReadOnlySubagentCall(args) {
   });
 }
 
+function syncTranscriptState(rawTranscriptPath) {
+  const statePath = getStatePath(rawTranscriptPath);
+  let tPath = rawTranscriptPath || "";
+  const fullPath = tPath.endsWith("transcript.jsonl")
+    ? tPath.replace(/transcript\.jsonl$/, "transcript_full.jsonl")
+    : tPath;
+  if (tPath.endsWith("transcript_full.jsonl")) {
+    const compact = tPath.replace("transcript_full.jsonl", "transcript.jsonl");
+    if (fs.existsSync(compact)) tPath = compact;
+  }
+  if (!tPath || !fs.existsSync(tPath)) {
+    return { exists: false, statePath, state: createInitialState() };
+  }
+
+  let state = loadState(statePath);
+  const fd = fs.openSync(tPath, "r");
+  const stats = fs.fstatSync(fd);
+
+  const canReadDelta = Boolean(
+    state.stateVersion === 2 &&
+    typeof state.lastScannedOffset === "number" &&
+    state.lastScannedOffset > 0 &&
+    state.lastScannedOffset <= stats.size
+  );
+
+  if (canReadDelta && state.lastScannedOffset === stats.size) {
+    fs.closeSync(fd);
+    return { exists: true, statePath, state };
+  }
+
+  let readStart = 0;
+  if (canReadDelta) {
+    readStart = state.lastScannedOffset;
+  } else {
+    state = createInitialState();
+    if (stats.size > 1048576) {
+      const headSize = Math.min(stats.size, 65536);
+      const headBuf = Buffer.alloc(headSize);
+      fs.readSync(fd, headBuf, 0, headSize, 0);
+      const headStr = headBuf.toString("utf-8");
+      if (/"source"\s*:\s*"USER_EXPLICIT"|"type"\s*:\s*"USER_INPUT"/.test(headStr)) {
+        state.hasUserInput = true;
+      }
+      readStart = stats.size - 1048576;
+    }
+  }
+
+  const readSize = stats.size - readStart;
+  const buffer = Buffer.alloc(readSize);
+  fs.readSync(fd, buffer, 0, readSize, readStart);
+  fs.closeSync(fd);
+
+  let offsetInBuf = 0;
+  if (readStart > 0 && !canReadDelta) {
+    const firstNl = buffer.indexOf(0x0a, 0);
+    if (firstNl !== -1) {
+      offsetInBuf = firstNl + 1;
+    }
+  }
+
+  let lastValidOffset = readStart + offsetInBuf;
+
+  while (offsetInBuf < buffer.length) {
+    const nlIdx = buffer.indexOf(0x0a, offsetInBuf);
+    const lineEnd = nlIdx !== -1 ? nlIdx : buffer.length;
+    const nextOffsetInBuf = nlIdx !== -1 ? nlIdx + 1 : buffer.length;
+    const rawLine = buffer.toString("utf-8", offsetInBuf, lineEnd).trim();
+
+    if (!rawLine) {
+      lastValidOffset = readStart + nextOffsetInBuf;
+      offsetInBuf = nextOffsetInBuf;
+      continue;
+    }
+
+    let e;
+    try {
+      e = JSON.parse(rawLine);
+    } catch (err) {
+      if (nlIdx === -1) break;
+      lastValidOffset = readStart + nextOffsetInBuf;
+      offsetInBuf = nextOffsetInBuf;
+      continue;
+    }
+
+    const content = e.content || "";
+    const stepIdx = typeof e.step_index === "number" ? e.step_index : -1;
+
+    if (e.source === "USER_EXPLICIT" || e.type === "USER_INPUT") {
+      state.hasUserInput = true;
+    }
+    if (
+      (e.type === "SYSTEM_MESSAGE" || e.source === "SYSTEM") &&
+      /\[Message\]\s+timestamp=[^\r\n]+?\s+sender=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(content)
+    ) {
+      state.hasParentSenderMessage = true;
+    }
+
+    if (state.approved && state.approvedStepIndex >= 0 && stepIdx >= 0 && stepIdx <= state.approvedStepIndex) {
+      lastValidOffset = readStart + nextOffsetInBuf;
+      offsetInBuf = nextOffsetInBuf;
+      continue;
+    }
+
+    // 熔断线 3：用户在界面手动点击 Stop / Cancel 中断执行 -> 立即撤权
+    if (e.status === "CANCELED" || e.status === "CANCELLED") {
+      state.approved = false;
+      state.approvedStepIndex = -1;
+      state.lastResetReason = "canceled";
+    }
+
+    // 熔断线 1：新用户消息输入 -> 除非明确包含直接授权词，否则立即撤权归零
+    if (e.source === "USER_EXPLICIT" || e.type === "USER_INPUT") {
+      state.pendingToolCalls = [];
+      state.pendingStepIndex = -1;
+      state.hasPlanSinceLastReset = false;
+      state.hasAssistantContentSinceLastReset = false;
+      state.currentAskStepFound = false;
+      state.currentAskStepHasContent = false;
+      if (isUserAuthorized(content)) {
+        state.approved = true;
+        state.approvedStepIndex = stepIdx;
+      } else {
+        state.approved = false;
+        state.approvedStepIndex = -1;
+        state.lastResetReason = "user_input";
+      }
+      lastValidOffset = readStart + nextOffsetInBuf;
+      offsetInBuf = nextOffsetInBuf;
+      continue;
+    }
+
+    if (e.type === "SYSTEM_MESSAGE" || e.source === "SYSTEM") {
+      state.currentAskStepFound = false;
+      state.currentAskStepHasContent = false;
+      if (isUserAuthorized(content)) {
+        state.approved = true;
+        if (stepIdx >= 0) state.approvedStepIndex = stepIdx;
+      }
+      lastValidOffset = readStart + nextOffsetInBuf;
+      offsetInBuf = nextOffsetInBuf;
+      continue;
+    }
+
+    if (e.type === "PLANNER_RESPONSE") {
+      const visibleText = typeof e.content === "string" ? e.content.trim() : "";
+      if (visibleText.length > 0) {
+        state.hasAssistantContentSinceLastReset = true;
+      }
+      if (Array.isArray(e.tool_calls)) {
+        state.pendingToolCalls = e.tool_calls;
+        state.pendingStepIndex = stepIdx;
+        const callsAsk = e.tool_calls.some((tc) => tc && tc.name === "ask_question");
+        if (callsAsk) {
+          state.currentAskStepFound = true;
+          state.currentAskStepHasContent = visibleText.length > 0;
+          // 熔断线 2a：发起新的 ask_question 弹窗时，旧授权挂起等待新弹窗响应
+          state.approved = false;
+          state.approvedStepIndex = -1;
+        }
+        for (const tc of e.tool_calls) {
+          if (tc && WRITE_FILE_TOOLS.has(tc.name) && tc.args) {
+            const tf = extractTargetFileFromArgs(tc.args).replace(/\\/g, "/").toLowerCase();
+            if (tf.endsWith("implementation_plan.md")) {
+              state.hasPlanSinceLastReset = true;
+            }
+          }
+        }
+      }
+      lastValidOffset = readStart + nextOffsetInBuf;
+      offsetInBuf = nextOffsetInBuf;
+      continue;
+    }
+
+    if (e.type === "GENERIC") {
+      state.currentAskStepFound = false;
+      state.currentAskStepHasContent = false;
+      if (
+        e.status === "DONE" &&
+        content.indexOf("Encountered error") === -1 &&
+        /(Created file|replace_file_content tool to:|Wrote to|Edited file|Made \d+ replacement)[^\r\n]*implementation_plan\.md/i.test(content)
+      ) {
+        state.hasPlanSinceLastReset = true;
+      }
+
+      let presetOpts = extractAskQuestionPresetOptions(state.pendingToolCalls);
+      if (presetOpts.size === 0 && state.pendingStepIndex >= 0 && fullPath && fs.existsSync(fullPath)) {
+        try {
+          const ffd = fs.openSync(fullPath, "r");
+          const fstats = fs.fstatSync(ffd);
+          const freadSize = Math.min(fstats.size, 2097152);
+          const fbuf = Buffer.alloc(freadSize);
+          fs.readSync(ffd, fbuf, 0, freadSize, Math.max(0, fstats.size - freadSize));
+          fs.closeSync(ffd);
+          const flines = fbuf.toString("utf-8").trim().split("\n");
+          for (let j = flines.length - 1; j >= 0; j--) {
+            try {
+              const fe = JSON.parse(flines[j]);
+              if (fe.step_index === state.pendingStepIndex && Array.isArray(fe.tool_calls)) {
+                presetOpts = extractAskQuestionPresetOptions(fe.tool_calls);
+                break;
+              }
+            } catch (e2) {}
+          }
+        } catch (e3) {}
+      }
+
+      const askEval = evaluateAskQuestionResponse(content, presetOpts);
+      if (askEval.isAskResponse) {
+        state.hasPlanSinceLastReset = false;
+        state.hasAssistantContentSinceLastReset = false;
+        if (askEval.approved) {
+          state.approved = true;
+          state.approvedStepIndex = stepIdx;
+          state.lastResetReason = "";
+        } else {
+          // 熔断线 2b：Write-In 提示词补充、点击暂不修改或跳过 -> 立即撤权归零
+          state.approved = false;
+          state.approvedStepIndex = -1;
+          state.lastResetReason = askEval.isWriteIn ? "write_in" : "ask_rejected";
+        }
+        state.pendingToolCalls = [];
+        state.pendingStepIndex = -1;
+      }
+    }
+
+    lastValidOffset = readStart + nextOffsetInBuf;
+    offsetInBuf = nextOffsetInBuf;
+  }
+
+  state.lastScannedOffset = lastValidOffset;
+  saveState(statePath, state);
+  return { exists: true, statePath, state };
+}
+
 function handlePreToolUse(payload) {
   try {
     const userLang = detectUserLang(payload.transcriptPath);
     const toolCall = payload.toolCall || {};
     const toolName = toolCall.name || "";
     const args = toolCall.args || {};
+
+    // 每次 PreToolUse 先执行增量字节同步（0 新增字节时 O(1) 瞬时返回，有新增行时确保即使先调只读工具也能立即捕获新 USER_INPUT 撤权）
+    const synced = syncTranscriptState(payload.transcriptPath);
+    const state = synced.state;
 
     // 阶段 1 & 2：模型无关纯只读工具、后台状态查询与只读子智能体直接放行（ask_question 需通过阶段 5 审计后再放行）
     if (toolName !== "ask_question" && isModelAgnosticReadOnlyTool(toolName, args)) {
@@ -378,19 +656,7 @@ function handlePreToolUse(payload) {
       }
     }
 
-    // 阶段 5：增量字节游标（lastScannedOffset）+ 精确审批步号（approvedStepIndex）状态机扫描
-    const statePath = getStatePath(payload.transcriptPath);
-    const state = loadState(statePath);
-
-    let tPath = payload.transcriptPath || "";
-    const fullPath = tPath.endsWith("transcript.jsonl")
-      ? tPath.replace(/transcript\.jsonl$/, "transcript_full.jsonl")
-      : tPath;
-    if (tPath.endsWith("transcript_full.jsonl")) {
-      const compact = tPath.replace("transcript_full.jsonl", "transcript.jsonl");
-      if (fs.existsSync(compact)) tPath = compact;
-    }
-    if (!tPath || !fs.existsSync(tPath)) {
+    if (!synced.exists) {
       if (toolName === "ask_question") {
         return reply({ decision: "allow" });
       }
@@ -402,196 +668,8 @@ function handlePreToolUse(payload) {
       });
     }
 
-    const fd = fs.openSync(tPath, "r");
-    const stats = fs.fstatSync(fd);
-    let hasUserInputInHead = false;
-    if (stats.size > 1048576) {
-      const headSize = Math.min(stats.size, 65536);
-      const headBuf = Buffer.alloc(headSize);
-      fs.readSync(fd, headBuf, 0, headSize, 0);
-      const headStr = headBuf.toString("utf-8");
-      if (/"source"\s*:\s*"USER_EXPLICIT"|"type"\s*:\s*"USER_INPUT"/.test(headStr)) {
-        hasUserInputInHead = true;
-      }
-    }
-
-    const hasValidCursor = Boolean(
-      state.approved &&
-      typeof state.approvedStepIndex === "number" &&
-      state.approvedStepIndex >= 0 &&
-      typeof state.lastScannedOffset === "number" &&
-      state.lastScannedOffset > 0 &&
-      state.lastScannedOffset <= stats.size
-    );
-    const cursorDelta = hasValidCursor ? (stats.size - state.lastScannedOffset + 65536) : 0;
-    const readSize = Math.min(stats.size, Math.max(1048576, cursorDelta));
-    const readStart = Math.max(0, stats.size - readSize);
-    const buffer = Buffer.alloc(readSize);
-    fs.readSync(fd, buffer, 0, readSize, readStart);
-    fs.closeSync(fd);
-
-    const chunk = buffer.toString("utf-8");
-    const lines = chunk.trim().split("\n");
-
-    let isApproved = Boolean(hasValidCursor && readStart <= state.lastScannedOffset);
-    let approvedStepIndex = isApproved ? state.approvedStepIndex : -1;
-    let hasPlanSinceLastReset = false;
-    let hasAssistantContentSinceLastReset = false;
-    let currentAskStepFound = false;
-    let currentAskStepHasContent = false;
-    let lastResetReason = "initial";
-    let pendingToolCalls = [];
-    let pendingStepIndex = -1;
-    let hasUserInput = hasUserInputInHead;
-    let hasParentSenderMessage = false;
-
-    for (let i = 0; i < lines.length; i++) {
-      try {
-        const e = JSON.parse(lines[i]);
-        const content = e.content || "";
-        const stepIdx = typeof e.step_index === "number" ? e.step_index : -1;
-
-        if (e.source === "USER_EXPLICIT" || e.type === "USER_INPUT") {
-          hasUserInput = true;
-        }
-        if (
-          (e.type === "SYSTEM_MESSAGE" || e.source === "SYSTEM") &&
-          /\[Message\]\s+timestamp=[^\r\n]+?\s+sender=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(content)
-        ) {
-          hasParentSenderMessage = true;
-        }
-
-        // 若当前处于增量游标已授权状态，且该行发生在 approvedStepIndex 之前或当时，不重复触发旧行撤权
-        if (isApproved && approvedStepIndex >= 0 && stepIdx >= 0 && stepIdx <= approvedStepIndex) {
-          continue;
-        }
-
-        // 熔断线 3：用户在界面手动点击 Stop / Cancel 中断执行 -> 立即撤权
-        if (e.status === "CANCELED" || e.status === "CANCELLED") {
-          isApproved = false;
-          approvedStepIndex = -1;
-          lastResetReason = "canceled";
-        }
-
-        // 熔断线 1：新用户消息输入 -> 除非明确包含直接授权词，否则立即撤权归零
-        if (e.source === "USER_EXPLICIT" || e.type === "USER_INPUT") {
-          pendingToolCalls = [];
-          pendingStepIndex = -1;
-          hasPlanSinceLastReset = false;
-          hasAssistantContentSinceLastReset = false;
-          currentAskStepFound = false;
-          currentAskStepHasContent = false;
-          if (isUserAuthorized(content)) {
-            isApproved = true;
-            approvedStepIndex = stepIdx;
-          } else {
-            isApproved = false;
-            approvedStepIndex = -1;
-            lastResetReason = "user_input";
-          }
-          continue;
-        }
-
-        if (e.type === "SYSTEM_MESSAGE" || e.source === "SYSTEM") {
-          currentAskStepFound = false;
-          currentAskStepHasContent = false;
-          if (isUserAuthorized(content)) {
-            isApproved = true;
-            if (stepIdx >= 0) approvedStepIndex = stepIdx;
-          }
-          continue;
-        }
-
-        if (e.type === "PLANNER_RESPONSE") {
-          const visibleText = typeof e.content === "string" ? e.content.trim() : "";
-          if (visibleText.length > 0) {
-            hasAssistantContentSinceLastReset = true;
-          }
-          if (Array.isArray(e.tool_calls)) {
-            pendingToolCalls = e.tool_calls;
-            pendingStepIndex = stepIdx;
-            const callsAsk = e.tool_calls.some((tc) => tc && tc.name === "ask_question");
-            if (callsAsk) {
-              currentAskStepFound = true;
-              currentAskStepHasContent = visibleText.length > 0;
-              // 熔断线 2a：发起新的 ask_question 弹窗时，旧授权挂起等待新弹窗响应
-              isApproved = false;
-              approvedStepIndex = -1;
-            }
-            for (const tc of e.tool_calls) {
-              if (tc && WRITE_FILE_TOOLS.has(tc.name) && tc.args) {
-                const tf = extractTargetFileFromArgs(tc.args).replace(/\\/g, "/").toLowerCase();
-                if (tf.endsWith("implementation_plan.md")) {
-                  hasPlanSinceLastReset = true;
-                }
-              }
-            }
-          }
-          continue;
-        }
-
-        if (e.type === "GENERIC") {
-          currentAskStepFound = false;
-          currentAskStepHasContent = false;
-          if (
-            e.status === "DONE" &&
-            content.indexOf("Encountered error") === -1 &&
-            /(Created file|replace_file_content tool to:|Wrote to|Edited file|Made \d+ replacement)[^\r\n]*implementation_plan\.md/i.test(content)
-          ) {
-            hasPlanSinceLastReset = true;
-          }
-
-          let presetOpts = extractAskQuestionPresetOptions(pendingToolCalls);
-          if (presetOpts.size === 0 && pendingStepIndex >= 0 && fullPath && fs.existsSync(fullPath)) {
-            try {
-              const ffd = fs.openSync(fullPath, "r");
-              const fstats = fs.fstatSync(ffd);
-              const freadSize = Math.min(fstats.size, 2097152);
-              const fbuf = Buffer.alloc(freadSize);
-              fs.readSync(ffd, fbuf, 0, freadSize, Math.max(0, fstats.size - freadSize));
-              fs.closeSync(ffd);
-              const flines = fbuf.toString("utf-8").trim().split("\n");
-              for (let j = flines.length - 1; j >= 0; j--) {
-                try {
-                  const fe = JSON.parse(flines[j]);
-                  if (fe.step_index === pendingStepIndex && Array.isArray(fe.tool_calls)) {
-                    presetOpts = extractAskQuestionPresetOptions(fe.tool_calls);
-                    break;
-                  }
-                } catch (e2) {}
-              }
-            } catch (e3) {}
-          }
-
-          const askEval = evaluateAskQuestionResponse(content, presetOpts);
-          if (askEval.isAskResponse) {
-            hasPlanSinceLastReset = false;
-            hasAssistantContentSinceLastReset = false;
-            if (askEval.approved) {
-              isApproved = true;
-              approvedStepIndex = stepIdx;
-            } else {
-              // 熔断线 2b：Write-In 提示词补充、点击暂不修改或跳过 -> 立即撤权归零
-              isApproved = false;
-              approvedStepIndex = -1;
-              lastResetReason = askEval.isWriteIn ? "write_in" : "ask_rejected";
-            }
-            pendingToolCalls = [];
-            pendingStepIndex = -1;
-            continue;
-          }
-        }
-      } catch (err) {}
-    }
-
-    // 同步持久化最新增量字节游标与本轮授权状态
-    state.approved = isApproved;
-    state.approvedStepIndex = isApproved ? approvedStepIndex : -1;
-    state.lastScannedOffset = stats.size;
-    saveState(statePath, state);
-
     // 子智能体会话识别：无人类直接输入（USER_EXPLICIT）且由父智能体 SYSTEM_MESSAGE (sender=<UUID>) 唤醒
-    const isSubagent = !hasUserInput && hasParentSenderMessage;
+    const isSubagent = !state.hasUserInput && state.hasParentSenderMessage;
     if (isSubagent) {
       if (toolName === "ask_question") {
         return reply({
@@ -606,7 +684,7 @@ function handlePreToolUse(payload) {
 
     // 针对主智能体 ask_question 本身的「必先输出聊天正文解释」「防折叠藏匿」与「分级展示」审计
     if (toolName === "ask_question") {
-      if ((currentAskStepFound && !currentAskStepHasContent) || (!currentAskStepFound && !hasAssistantContentSinceLastReset)) {
+      if ((state.currentAskStepFound && !state.currentAskStepHasContent) || (!state.currentAskStepFound && !state.hasAssistantContentSinceLastReset)) {
         return reply({
           decision: "deny",
           reason: userLang === "zh"
@@ -654,12 +732,12 @@ function handlePreToolUse(payload) {
     }
 
     // 分支 1：已通过 ask_question 预设选项点击或明确授权（增量字节游标确认本轮内无撤权事件）-> 直接放行
-    if (isApproved) {
+    if (state.approved) {
       return reply({ decision: "allow" });
     }
 
     // 分支 2：用户在 ask_question 中使用了自定义输入（Write-In 提示词补充），模型尚未重新调用 ask_question 获得确认
-    if (lastResetReason === "write_in") {
+    if (state.lastResetReason === "write_in") {
       return reply({
         decision: "deny",
         reason: userLang === "zh"
@@ -669,7 +747,7 @@ function handlePreToolUse(payload) {
     }
 
     // 分支 3：已生成 implementation_plan.md 但尚未调用 ask_question 取得用户按钮确认 -> 拦截同回合抢跑
-    if (hasPlanSinceLastReset) {
+    if (state.hasPlanSinceLastReset) {
       return reply({
         decision: "deny",
         reason: userLang === "zh"
@@ -749,28 +827,23 @@ function handlePostToolUse(payload) {
         stripArtifactFeedbackButton(rawTarget, false);
       }
     }
-    // 增量字节游标刷新：当非 ask_question 的受控工具执行完毕且当前 state.approved 为 true 时，推进游标至最新 EOF
-    const statePath = getStatePath(payload.transcriptPath);
-    const state = loadState(statePath);
-    if (state.approved && toolName !== "ask_question" && payload.transcriptPath) {
-      let tPath = payload.transcriptPath;
-      if (tPath.endsWith("transcript_full.jsonl")) {
-        const compact = tPath.replace("transcript_full.jsonl", "transcript.jsonl");
-        if (fs.existsSync(compact)) tPath = compact;
-      }
-      if (fs.existsSync(tPath)) {
-        state.lastScannedOffset = fs.statSync(tPath).size;
-        saveState(statePath, state);
-      }
+    // 执行增量同步（仅实际解析新增 JSONL 行，绝不盲目覆盖 lastScannedOffset）
+    if (payload && payload.transcriptPath) {
+      syncTranscriptState(payload.transcriptPath);
     }
   } catch (e) {}
   return reply({});
 }
 
 function handlePreInvocation(payload) {
-  if (payload && payload.transcriptPath && hasRecentPlanApproval(payload.transcriptPath)) {
-    return reply({});
-  }
+  try {
+    if (payload && payload.transcriptPath) {
+      const synced = syncTranscriptState(payload.transcriptPath);
+      if (synced.exists && synced.state.approved) {
+        return reply({});
+      }
+    }
+  } catch (e) {}
   const userLang = detectUserLang(payload && payload.transcriptPath);
   const zhMessage = "【方案门禁在线（主智能体单点确认 · 子智能体免弹窗直通）】1) 若当前会话是由主智能体通过 invoke_subagent 委派的子智能体（Subagent，即收到 <SYSTEM_MESSAGE> [Message] ... sender=... 指令），主智能体在派单前已完成用户确认，子智能体【严禁调用 ask_question 弹窗阻塞】，必须直接按施工图并发执行文件读写与终端验证！2) 若当前会话为直接面向用户的【主智能体（Main Agent）】，执行任何代码/文档修改或派发写盘子智能体前，必须通过 ask_question 弹出按钮卡片暂停确认，并遵守三项 UI 铁律：a) 同回合先正文解释再弹窗（调用 ask_question 的同一回合必须在聊天正文 content 中先输出完整的原因分析与解释说明，严禁无正文裸调弹窗；question 窗口直接列出【纯修改方案】与目标业务文件 [文件名](file:///...) 芯片；简单任务免写 implementation_plan.md 不弹大卡片，复杂任务先写 implementation_plan.md 并在 question 标题旁附 [implementation_plan.md](file:///...) 芯片供弹窗期预览，回合结束时底部自动挂载 Implementation Plan 大卡片，严禁不写方案只写「详见正文/方案」）；b) 选项只做极简按钮（单方案：[\"(Recommended) 确认执行\", \"暂不修改\"]；多方案：[\"(Recommended) 采用方案 A\", \"采用方案 B\", \"暂不修改\"]，严禁在 options 中重复抄写方案）；c) Write-In 自定义输入视为提示词补充，须在聊天正文回应并调整方案后再次调用 ask_question 确认！";
   const enMessage = "[Plan Guard Online (Main Agent Single-Point Confirmation | Subagents Bypass)] 1) If the current conversation is a subagent delegated by the main agent via invoke_subagent (received <SYSTEM_MESSAGE> [Message] ... sender=... instruction), the main agent has already obtained user confirmation. Subagents are STRICTLY FORBIDDEN from calling ask_question to block for user input; proceed directly with concurrent file operations and terminal verifications per the plan! 2) If the current conversation is the user-facing Main Agent, before executing any code/document mutations or dispatching mutating subagents, you MUST call ask_question to pause for button confirmation, adhering to three UI rules: a) Provide chat body explanation before popup in the same turn (always output full analysis and rationale in chat content first; never call ask_question with empty content. Place pure modification plan and target [filename](file:///...) chips directly in the question window. Skip implementation_plan.md for simple tasks <=3 files; write implementation_plan.md for complex tasks >3 files and include [implementation_plan.md](file:///...) chip in question. Never say 'see above/refer to plan'); b) Use concise action options only (single option: [\"(Recommended) Confirm & Execute\", \"Cancel\"]; multiple options: [\"(Recommended) Option A\", \"Option B\", \"Cancel\"]; never duplicate plan details in options); c) Treat custom write-in input as prompt refinement; address it in chat content and call ask_question again for approval!";
@@ -779,6 +852,22 @@ function handlePreInvocation(payload) {
       ephemeralMessage: userLang === "zh" ? zhMessage : enMessage
     }]
   });
+}
+
+function handleStop(payload) {
+  try {
+    if (payload && payload.transcriptPath) {
+      const synced = syncTranscriptState(payload.transcriptPath);
+      const reason = String(payload.terminationReason || "");
+      // 官方 Stop 契约：当用户取消（USER_CANCELED）或当前回合完全结束且无后台任务（NO_TOOL_CALL && fullyIdle）时，自动归零本轮授权
+      if (reason === "USER_CANCELED" || (reason === "NO_TOOL_CALL" && payload.fullyIdle === true)) {
+        synced.state.approved = false;
+        synced.state.approvedStepIndex = -1;
+        saveState(synced.statePath, synced.state);
+      }
+    }
+  } catch (e) {}
+  return reply({ decision: "allow" });
 }
 
 async function main() {
@@ -797,6 +886,7 @@ async function main() {
   try { if (raw.trim()) payload = JSON.parse(raw); } catch (e) {}
   if (mode === "pre-invocation") handlePreInvocation(payload);
   else if (mode === "post-tool") handlePostToolUse(payload);
+  else if (mode === "stop") handleStop(payload);
   else handlePreToolUse(payload);
 }
 

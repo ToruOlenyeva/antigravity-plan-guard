@@ -30,6 +30,13 @@
         "command": "node guard.cjs pre-invocation",
         "timeout": 10
       }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node guard.cjs stop",
+        "timeout": 10
+      }
     ]
   }
 }
