@@ -871,6 +871,117 @@ function handleStop(payload) {
   return reply({ decision: "allow" });
 }
 
+function resolveHostHomeDir() {
+  const normalized = __dirname.replace(/\\/g, "/");
+  const geminiIdx = normalized.toLowerCase().indexOf("/.gemini/");
+  if (geminiIdx > 0) {
+    const candidate = path.normalize(__dirname.slice(0, geminiIdx));
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  const os = require("os");
+  return os.homedir();
+}
+
+function normalizePathForMatch(str) {
+  if (!str || typeof str !== "string") return "";
+  let p = str.trim().replace(/^file:\/\/\//i, "").replace(/^file:\/\//i, "");
+  try { p = decodeURIComponent(p); } catch (_) {}
+  p = p.replace(/\\/g, "/").replace(/^([a-zA-Z])%3A/i, "$1:").replace(/^\/([a-zA-Z]:)/, "$1");
+  while (p.endsWith("/")) p = p.slice(0, -1);
+  return p.toLowerCase();
+}
+
+function isPlanGuardEnabledForPayload(payload) {
+  try {
+    const homeDir = resolveHostHomeDir();
+    const profilesPath = path.join(homeDir, ".gemini", "config", "project-plugin-profiles.json");
+    const configPath = path.join(homeDir, ".gemini", "config", "config.json");
+    const convDbPath = path.join(homeDir, ".gemini", "antigravity", "conversation_summaries.db");
+
+    let profiles = null;
+    if (fs.existsSync(profilesPath)) {
+      try { profiles = JSON.parse(fs.readFileSync(profilesPath, "utf8")); } catch (_) {}
+    }
+    if (!profiles && fs.existsSync(profilesPath + ".bak")) {
+      try { profiles = JSON.parse(fs.readFileSync(profilesPath + ".bak", "utf8")); } catch (_) {}
+    }
+
+    let convId = String(
+      (payload && (payload.conversationId || payload.conversation_id || payload.trajectoryId || payload.trajectory_id || payload.cascadeId)) || ""
+    ).trim();
+    if (!convId && payload && (payload.transcriptPath || payload.transcript_path)) {
+      const m = String(payload.transcriptPath || payload.transcript_path).replace(/\\/g, "/").match(/\/brain\/([0-9a-f-]{36})\//i);
+      if (m && m[1]) convId = m[1];
+    }
+
+    let projectId = String((payload && (payload.projectId || payload.project_id)) || "").trim();
+
+    // 1. 优先从 SQLite 权威表查询会话所属的真实 project_id（含纯聊天项目）
+    if (!projectId && convId && fs.existsSync(convDbPath)) {
+      try {
+        const { DatabaseSync } = require("node:sqlite");
+        const db = new DatabaseSync(convDbPath, { readOnly: true, open: true });
+        const row = db.prepare("SELECT project_id FROM conversation_summaries WHERE conversation_id = ?").get(convId);
+        db.close();
+        if (row && row.project_id) projectId = String(row.project_id).trim();
+      } catch (_) {}
+    }
+
+    // 2. 次选从 profiles.__meta__.convProjectMap 或当前活跃 Sidecar 会话映射读取
+    if (!projectId && convId && profiles && profiles.__meta__) {
+      const mapped = profiles.__meta__.convProjectMap && profiles.__meta__.convProjectMap[convId];
+      if (mapped && profiles[mapped]) {
+        projectId = mapped;
+      } else if (profiles.__meta__.lastSidecarConvId === convId && profiles.__meta__.lastSidecarProjectId) {
+        projectId = profiles.__meta__.lastSidecarProjectId;
+      }
+    }
+
+    // 3. 若仍未命中，根据会话显式挂载的 workspaceUris 匹配项目路径（不把读文件的工具参数当作会话所属项目）
+    if (!projectId && profiles && payload) {
+      const uris = [];
+      if (Array.isArray(payload.workspaceUris)) uris.push(...payload.workspaceUris);
+      else if (Array.isArray(payload.workspace_uris)) uris.push(...payload.workspace_uris);
+      else if (typeof payload.workspaceUri === "string") uris.push(payload.workspaceUri);
+      else if (typeof payload.cwd === "string") uris.push(payload.cwd);
+
+      let bestId = "";
+      let bestScore = -1;
+      for (const u of uris) {
+        const nu = normalizePathForMatch(u);
+        if (!nu) continue;
+        for (const [k, prof] of Object.entries(profiles)) {
+          if (k === "__meta__" || k === "__default__" || !prof || !Array.isArray(prof.paths)) continue;
+          for (const p of prof.paths) {
+            const np = normalizePathForMatch(p);
+            if (!np) continue;
+            const score = nu === np ? 10000 + np.length : (nu.startsWith(np + "/") ? np.length : -1);
+            if (score > bestScore) {
+              bestScore = score;
+              bestId = k;
+            }
+          }
+        }
+      }
+      if (bestId) projectId = bestId;
+    }
+
+    // 4. 核对目标项目的 plan-guard 独立配置开关
+    if (projectId && profiles && profiles[projectId] && profiles[projectId].plugins && profiles[projectId].plugins["plan-guard"] !== undefined) {
+      return Boolean(profiles[projectId].plugins["plan-guard"]);
+    }
+
+    // 5. 兜底核对全局 config.json
+    if (fs.existsSync(configPath)) {
+      const cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
+      if (cfg && cfg.plugins && cfg.plugins["plan-guard"] && cfg.plugins["plan-guard"].enabled !== undefined) {
+        return cfg.plugins["plan-guard"].enabled !== false;
+      }
+    }
+  } catch (_) {}
+  return true;
+}
+
 async function main() {
   const mode = process.argv[2] || "pre-tool";
   if (mode === "strip-meta") {
@@ -885,6 +996,10 @@ async function main() {
   const raw = await readStdin();
   let payload = {};
   try { if (raw.trim()) payload = JSON.parse(raw); } catch (e) {}
+  if (!isPlanGuardEnabledForPayload(payload)) {
+    if (mode === "pre-invocation" || mode === "post-tool") return reply({});
+    return reply({ decision: "allow" });
+  }
   if (mode === "pre-invocation") handlePreInvocation(payload);
   else if (mode === "post-tool") handlePostToolUse(payload);
   else if (mode === "stop") handleStop(payload);
