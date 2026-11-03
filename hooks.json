@@ -35,7 +35,7 @@
       {
         "type": "command",
         "command": "node guard.cjs stop",
-        "timeout": 10
+        "timeout": 180
       }
     ]
   }
