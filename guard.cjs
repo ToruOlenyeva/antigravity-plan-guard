@@ -292,9 +292,9 @@ function isUserAuthorized(text) {
   // 若首句明确表达选择某套方案（如「我想选方案B」），即使后半句附带顺带提问也视为对方案 B 的授权
   if (/^(我想选|我选|选择|采用|就选|就用|选)\s*方案\s*[A-Za-z0-9一二三四]/i.test(clean)) return true;
   if (/[?？]/.test(clean) || /(为什么|怎么|能不能|你可以|难道|是否|有吗|好用吗|对吗|更好|是不是|忘了|没弄)/.test(clean)) return false;
-  const standaloneAuth = /^(确认|执行|可以|同意|修吧|改吧|好的|没问题|行|继续|好|ok|yes|proceed|approve|开始|做吧|搞吧|动手|实施)$/i;
+  const standaloneAuth = /^(确认|确认执行|同意执行|按方案执行|开始执行|继续执行|立即执行|执行吧|修吧|改吧|动手吧|照此修改|同意|可以|好的|没问题|行|继续|好|ok|yes|proceed|approve)[!！。.\s]*$/i;
   if (standaloneAuth.test(clean)) return true;
-  const explicitAction = /^(那就|请|确认|同意|批准|立即)[\s\S]+(修改|修复|执行|添加|改动|重构|写|装|落实|落地)/;
+  const explicitAction = /^(确认|同意|批准|准许|按方案|照方案)[\s\S]{0,20}(修改|修复|执行|改动|重构|落实|落地)[!！。.\s]*$/;
   if (explicitAction.test(clean)) return true;
   return false;
 }
@@ -1088,16 +1088,17 @@ function syncTranscriptState(rawTranscriptPath, payload) {
       state.approvedGrants = createEmptyGrants();
     }
 
-    // 熔断线 1：新用户消息输入 -> 除非明确包含直接授权词，否则立即撤权并清空权限范围
+    // 熔断线 1：新用户消息输入 -> 仅当已展示过方案/弹窗且用户回复明确授权词时才放行，否则一律归零并要求先出方案再确认
     if (e.source === "USER_EXPLICIT" || e.type === "USER_INPUT") {
       const hadPlan = state.hasPlanSinceLastReset;
+      const hadAsk = state.currentAskStepFound || (Array.isArray(state.pendingToolCalls) && state.pendingToolCalls.some((tc) => tc && tc.name === "ask_question"));
       state.pendingToolCalls = [];
       state.pendingStepIndex = -1;
       state.hasPlanSinceLastReset = false;
       state.hasAssistantContentSinceLastReset = false;
       state.currentAskStepFound = false;
       state.currentAskStepHasContent = false;
-      if (isUserAuthorized(content)) {
+      if ((hadPlan || hadAsk) && isUserAuthorized(content)) {
         state.approved = true;
         state.approvedStepIndex = stepIdx;
         state.lastResetReason = "";
