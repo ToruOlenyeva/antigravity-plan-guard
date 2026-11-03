@@ -54,7 +54,7 @@ graph TD
 - <b>会话级工作区独立固化（Per-Conversation Workspace Locking，前后台切换 100% 零串扰）</b>：由于 Antigravity 原生设置中「工作区外文件访问（Non-Workspace File Access）」将读取与写入捆绑控制，当搭配原生<b>极速 / 自动</b>预设开启全盘访问时，`plan-guard` 承担起了「允许全盘读取、严格把控工作区内外修改」的核心边界职责。为彻底杜绝用户在前台切换项目时后台运行中的对话发生工作区漂移，`resolveAndLockWorkspaceRoots()` 严禁读取 `lastActiveProjectId`、`lastSidecarProjectId`、`DevToolsActivePort` 或 `app_storage.json` 等前台焦点状态，而是严格通过当前会话自身的 `convId` 查询 `conversation_summaries.db`（及 `profiles.__meta__.convProjectMap[convId]`）锁定所属 `projectId`，汇总 `profiles[projectId].paths` 与 `~/.gemini/config/projects/<projectId>.json` 中的工作区目录并持久化固化至会话私有的 `guard-state.json`（`lockedWorkspaceRoots`）；子智能体会话则通过 `sender=<parentConvId>` 直接从父会话 `guard-state.json` 继承工作区与已批准权限。
 - <b>后台隐式权限申请与按单精准放行（`extractScopeGrantsFromPlan` & `verifyToolCallAgainstApprovedGrants`）</b>：
   1. <b>修改工具隐式申请</b>：主智能体在 `ask_question` 弹窗中仅需用自然语言向用户说明要修改哪些内容，无需罗列 `edit_file`、`write_file` 等具体工具名，`guard.cjs` 会在后台自动挂起 `pendingGrants.allowMutatingTools = true` 与 `pendingGrants.allowWorkspaceWrite = true`。
-  2. <b>工作区外粗粒度目录前缀提取</b>：当方案涉及修改工作区外的内容时，主智能体仅需在方案中说明要修改哪些工作区外的项目或目录（无需写出每个深层子文件的完整路径），后台自动扫描方案文本与 `implementation_plan.md` 中的外部路径、`file:///` 链接及已知项目名，自动提升为对应的外部项目根目录或父目录前缀存入 `pendingGrants.externalPathPrefixes`。
+  2. <b>按项目名/插件名/文件芯片自动映射外部目录与弹窗禁裸路径</b>：当方案涉及修改工作区外的内容时，主智能体仅需在方案中写明要修改哪些工作区外的项目名或插件名（如「修改 `antigravity-relay` 插件」，严禁在 `ask_question` 文本中直接暴露 `C:/Users/...` 等冗长绝对路径，且 `brain/<id>/scratch` 临时目录默认免申报），`lib/workspace-grants.cjs` 会在后台自动扫描已知项目名、`~/.gemini/config/plugins/<name>` 插件目录名、兄弟项目目录名、同回合聊天正文 `[文件名](file:///...)` 芯片及 `implementation_plan.md`，自动提升为对应的外部目录前缀存入 `pendingGrants.externalPathPrefixes`。
   3. <b>同意后按单放行与越界硬阻断</b>：用户点击确认后，`pendingGrants` 激活为 `approvedGrants`；后续写盘工具与非只读终端命令若指向 `lockedWorkspaceRoots` 内或命中 `approvedGrants.externalPathPrefixes` 则直接放行，若指向未申请的工作区外路径则立即返回 `{"decision": "deny"}` 硬阻断并要求补充申请。
 - <b>单回合授权生命周期（Turn-Scoped Approval Lifecycle）</b>：针对同一任务回合内的多步写盘、代码构建及 `call_mcp_tool` 浏览器自动化等连续操作，一旦通过 `ask_question` 或显式指令授权，当前回合内已申请范围内的受控工具调用均连续放行；当智能体主动结束回合（触发 `Stop` 钩子：`terminationReason === "NO_TOOL_CALL" && fullyIdle === true`）或收到新一条人类非授权指令（`USER_INPUT`）时，门禁立即归零 `approved = false` 并清空 `pendingGrants` 与 `approvedGrants`（保留会话固化的 `lockedWorkspaceRoots`），杜绝跨回合无感知越权修改。
 - <b>后台终端防卡死本地日志尾监控（Stop Hook Log-Tail Stagnation Watchdog）</b>：当智能体调用非守护后台命令（`run_command` 转为后台任务 `task-XXXX`）并停止调用工具等待通知时，宿主触发 `Stop` 钩子且载荷为 `terminationReason === "NO_TOOL_CALL" && fullyIdle === false`。此时若后台命令衍生了未断开 `stdout/stderr` 管道句柄的子进程（如重启 Sidecar 服务后紧跟 `Invoke-RestMethod` 验证），PowerShell 主进程不会退出，导致宿主永远等不到进程结束事件而无限挂在 `1 task running`。`guard.cjs stop` 在 Node.js 本地以 0 Token 开销轮询监控 `.system_generated/tasks/task-XXXX.log` 的字节增长状态：
@@ -122,11 +122,16 @@ plan-guard/
 ├── README.md
 ├── README.en.md
 ├── plugin.json
+├── hooks.json
 ├── hooks.example.json
 ├── assets/
 │   └── logo.svg
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   └── ARCHITECTURE.en.md
+├── lib/
+│   ├── read-only-audit.cjs
+│   ├── workspace-grants.cjs
+│   └── transcript-state.cjs
 └── guard.cjs
 ```

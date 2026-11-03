@@ -54,7 +54,7 @@ Read-only research subagents or sub-sessions explicitly authorized by the primar
 - <b>Per-Conversation Workspace Locking (100% Immune to Foreground Project Switching)</b>: Because Antigravity's native `Non-Workspace File Access` setting couples reading and writing together, pairing native <b>Turbo / Auto</b> presets with `plan-guard` enables unrestricted full-disk reading alongside strict workspace and external write boundaries. To ensure background conversations never drift when the user switches projects in the foreground UI, `resolveAndLockWorkspaceRoots()` strictly forbids reading foreground focus indicators (`lastActiveProjectId`, `lastSidecarProjectId`, `DevToolsActivePort`, or `app_storage.json`). Instead, it resolves `projectId` exclusively via the conversation's own `convId` against `conversation_summaries.db` and `profiles.__meta__.convProjectMap[convId]`, aggregates workspace directories from `profiles[projectId].paths` and `~/.gemini/config/projects/<projectId>.json`, and locks `lockedWorkspaceRoots` inside the conversation's private `guard-state.json`. Delegated subagents automatically inherit `lockedWorkspaceRoots` and `approvedGrants` from their parent conversation via `sender=<parentConvId>`.
 - <b>Implicit Background Grant Extraction & Scoped Enforcement (`extractScopeGrantsFromPlan` & `verifyToolCallAgainstApprovedGrants`)</b>:
   1. <b>Implicit Mutation Tool Application</b>: When presenting a plan in `ask_question`, the agent explains what will be changed in plain language without needing to write specific tool names (`edit_file`, `write_file`); `guard.cjs` automatically stages `pendingGrants.allowMutatingTools = true` and `pendingGrants.allowWorkspaceWrite = true` in the background.
-  2. <b>Coarse-Grained Out-of-Workspace Prefix Promotion</b>: When out-of-workspace changes are needed, the agent simply mentions the target external project or directory in the plan (without needing every leaf file path); the background extractor promotes external paths, `file:///` URIs, and known project names to their external project root or parent directory prefix inside `pendingGrants.externalPathPrefixes`.
+  2. <b>Name/Chip-Based Out-of-Workspace Prefix Resolution & Clean Modal Enforcement</b>: When out-of-workspace changes are needed, the agent simply states the target external project or plugin name in the plan (e.g., `modify antigravity-relay plugin`—exposing raw full filesystem paths like `C:/Users/...` in `ask_question` text is strictly intercepted, and `brain/<id>/scratch` temp files require no declaration); `lib/workspace-grants.cjs` automatically resolves known project names, `~/.gemini/config/plugins/<name>` plugin directories, sibling project folders, same-turn `[filename](file:///...)` Markdown chips, and `implementation_plan.md` into coarse external directory prefixes inside `pendingGrants.externalPathPrefixes`.
   3. <b>Scoped Execution & Out-of-Bounds Interception</b>: Once approved by the user, `pendingGrants` activates as `approvedGrants`. Subsequent file writes and mutating terminal commands targeting `lockedWorkspaceRoots` or matching `approvedGrants.externalPathPrefixes` are allowed, while any undeclared out-of-workspace targets are strictly blocked (`{"decision": "deny"}`).
 - <b>Turn-Scoped Approval Lifecycle</b>: For multi-step disk writes, compilation tasks, and `call_mcp_tool` browser automation workflows within the same task turn, once approved via `ask_question` or explicit authorization, all in-scope controlled tool invocations remain authorized throughout the turn; as soon as the agent finishes its turn (triggering the `Stop` hook with `terminationReason === "NO_TOOL_CALL" && fullyIdle === true`) or a new non-approval `USER_INPUT` arrives, the gate immediately resets `approved = false` and clears `pendingGrants` and `approvedGrants` (while preserving `lockedWorkspaceRoots`), preventing cross-turn unauthorized mutations.
 - <b>Background Terminal Anti-Hang Watchdog (Stop Hook Log-Tail Stagnation Monitor)</b>: When the agent launches a non-daemon background command (`run_command` backgrounded as `task-XXXX`) and yields its turn awaiting notification, the host triggers the `Stop` hook with `terminationReason === "NO_TOOL_CALL" && fullyIdle === false`. If the command spawns a background child process that inherits open `stdout/stderr` handles (such as restarting a Sidecar service and querying `/api/status` in the same shell), the shell never exits and the conversation hangs indefinitely at `1 task running`. `guard.cjs stop` monitors `.system_generated/tasks/task-XXXX.log` locally in Node.js at zero token cost:
@@ -122,11 +122,16 @@ plan-guard/
 ├── README.md
 ├── README.en.md
 ├── plugin.json
+├── hooks.json
 ├── hooks.example.json
 ├── assets/
 │   └── logo.svg
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   └── ARCHITECTURE.en.md
+├── lib/
+│   ├── read-only-audit.cjs
+│   ├── workspace-grants.cjs
+│   └── transcript-state.cjs
 └── guard.cjs
 ```
