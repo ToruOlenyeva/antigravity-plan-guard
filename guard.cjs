@@ -73,7 +73,8 @@ function createInitialState() {
     lockedProjectId: "",
     lockedWorkspaceRoots: [],
     pendingGrants: createEmptyGrants(),
-    approvedGrants: createEmptyGrants()
+    approvedGrants: createEmptyGrants(),
+    activeBgTasks: {}
   };
 }
 
@@ -142,7 +143,7 @@ function isModelAgnosticReadOnlyTool(toolName, args = {}) {
 
   if (toolName === "manage_task") {
     const act = String(parseToolArg(args.Action) || "").toLowerCase();
-    if (act === "status" || act === "list") return true;
+    if (act === "status" || act === "list" || act === "kill" || act === "send_input") return true;
     return false;
   }
 
@@ -1079,13 +1080,14 @@ function syncTranscriptState(rawTranscriptPath, payload) {
       continue;
     }
 
-    // 熔断线 3：用户在界面手动点击 Stop / Cancel 中断执行 -> 立即撤权并清空已批准权限
+    // 熔断线 3：用户在界面手动点击 Stop / Cancel 中断执行 -> 立即撤权并清空已批准权限与后台任务表
     if (e.status === "CANCELED" || e.status === "CANCELLED") {
       state.approved = false;
       state.approvedStepIndex = -1;
       state.lastResetReason = "canceled";
       state.pendingGrants = createEmptyGrants();
       state.approvedGrants = createEmptyGrants();
+      state.activeBgTasks = {};
     }
 
     // 熔断线 1：新用户消息输入 -> 仅当已展示过方案/弹窗且用户回复明确授权词时才放行，否则一律归零并要求先出方案再确认
@@ -1098,6 +1100,7 @@ function syncTranscriptState(rawTranscriptPath, payload) {
       state.hasAssistantContentSinceLastReset = false;
       state.currentAskStepFound = false;
       state.currentAskStepHasContent = false;
+      state.activeBgTasks = {};
       if ((hadPlan || hadAsk) && isUserAuthorized(content)) {
         state.approved = true;
         state.approvedStepIndex = stepIdx;
@@ -1121,6 +1124,27 @@ function syncTranscriptState(rawTranscriptPath, payload) {
     if (e.type === "SYSTEM_MESSAGE" || e.source === "SYSTEM") {
       state.currentAskStepFound = false;
       state.currentAskStepHasContent = false;
+      if (/All your subagents and background tasks have been stopped/i.test(content)) {
+        state.activeBgTasks = {};
+      }
+      const finishedTaskMatch = content.match(/Task id "([^"]+)"\s+(?:finished|was killed|terminated|stopped|canceled)/i);
+      if (finishedTaskMatch && finishedTaskMatch[1] && state.activeBgTasks) {
+        const ftid = finishedTaskMatch[1].trim();
+        for (const k of Object.keys(state.activeBgTasks)) {
+          if (k === ftid || k.endsWith("/" + ftid) || ftid.endsWith("/" + k)) {
+            delete state.activeBgTasks[k];
+          }
+        }
+      }
+      const senderTaskMatch = content.match(/sender=([^\s]+\/task-\d+)/i);
+      if (senderTaskMatch && senderTaskMatch[1] && /(?:finished with result|Command exited|was killed|terminated|stopped)/i.test(content) && state.activeBgTasks) {
+        const stid = senderTaskMatch[1].trim();
+        for (const k of Object.keys(state.activeBgTasks)) {
+          if (k === stid || k.endsWith("/" + stid) || stid.endsWith("/" + k)) {
+            delete state.activeBgTasks[k];
+          }
+        }
+      }
       if (isUserAuthorized(content)) {
         state.approved = true;
         if (stepIdx >= 0) state.approvedStepIndex = stepIdx;
@@ -1146,6 +1170,17 @@ function syncTranscriptState(rawTranscriptPath, payload) {
             const tf = extractTargetFileFromArgs(tc.args).replace(/\\/g, "/").toLowerCase();
             if (tf.endsWith("implementation_plan.md")) {
               state.hasPlanSinceLastReset = true;
+            }
+          }
+          if (tc && tc.name === "manage_task" && tc.args) {
+            const act = String(parseToolArg(tc.args.Action) || "").toLowerCase();
+            const tid = String(parseToolArg(tc.args.TaskId) || "").trim();
+            if (act === "kill" && tid && state.activeBgTasks) {
+              for (const k of Object.keys(state.activeBgTasks)) {
+                if (k === tid || k.endsWith("/" + tid) || tid.endsWith("/" + k)) {
+                  delete state.activeBgTasks[k];
+                }
+              }
             }
           }
         }
@@ -1178,6 +1213,45 @@ function syncTranscriptState(rawTranscriptPath, payload) {
         /(Created file|replace_file_content tool to:|Wrote to|Edited file|Made \d+ replacement)[^\r\n]*implementation_plan\.md/i.test(content)
       ) {
         state.hasPlanSinceLastReset = true;
+      }
+
+      // 捕获转入后台运行的非守护进程终端命令（Tool is running as a background task with task id: ...）
+      const bgTaskMatch = content.match(/Tool is running as a background task with task id:\s*([A-Za-z0-9_\/-]+?)(?=\.?\s|$)/i);
+      if (bgTaskMatch && bgTaskMatch[1]) {
+        const taskId = bgTaskMatch[1].trim();
+        let isDaemon = false;
+        let toolSummary = "";
+        if (Array.isArray(state.pendingToolCalls)) {
+          for (const tc of state.pendingToolCalls) {
+            if (tc && EXEC_CMD_TOOLS.has(tc.name) && tc.args) {
+              if (parseToolArg(tc.args.IsDaemon) === true) isDaemon = true;
+              if (tc.args.toolSummary) toolSummary = String(tc.args.toolSummary);
+            }
+          }
+        }
+        if (!isDaemon) {
+          let logPath = "";
+          const logMatch = content.match(/(?:Task logs are available at|Full output is being written to):\s*(?:file:\/\/\/)?([^\r\n]+)/i);
+          if (logMatch && logMatch[1]) {
+            try { logPath = decodeURIComponent(logMatch[1].trim()); } catch (_) { logPath = logMatch[1].trim(); }
+          } else if (rawTranscriptPath) {
+            const m = String(rawTranscriptPath).replace(/\\/g, "/").match(/^(.*?\/brain\/[0-9a-f-]{36})\//i);
+            const shortTask = taskId.split("/").pop();
+            if (m && m[1] && shortTask) {
+              logPath = path.join(m[1], ".system_generated", "tasks", shortTask + ".log");
+            }
+          }
+          if (!state.activeBgTasks || typeof state.activeBgTasks !== "object") {
+            state.activeBgTasks = {};
+          }
+          const existing = state.activeBgTasks[taskId];
+          state.activeBgTasks[taskId] = {
+            taskId,
+            logPath: logPath || (existing && existing.logPath) || "",
+            toolSummary: toolSummary || (existing && existing.toolSummary) || "",
+            wakeupCount: existing && typeof existing.wakeupCount === "number" ? existing.wakeupCount : 0
+          };
+        }
       }
 
       let presetOpts = extractAskQuestionPresetOptions(state.pendingToolCalls);
@@ -1255,6 +1329,20 @@ function handlePreToolUse(payload) {
 
     // 阶段 1 & 2：全盘只读放行（模型无关纯只读工具、后台状态查询与只读子智能体不限工作区内外直接放行；ask_question 需通过阶段 5 审计后再放行）
     if (toolName !== "ask_question" && isModelAgnosticReadOnlyTool(toolName, args)) {
+      if (toolName === "manage_task" && args && typeof args === "object") {
+        const act = String(args.Action || args.action || "").toLowerCase();
+        const tid = String(args.TaskId || args.taskId || args.task_id || "").trim();
+        if (act === "kill" && tid && state.activeBgTasks) {
+          let removed = false;
+          for (const k of Object.keys(state.activeBgTasks)) {
+            if (k === tid || k.endsWith("/" + tid) || tid.endsWith("/" + k)) {
+              delete state.activeBgTasks[k];
+              removed = true;
+            }
+          }
+          if (removed) saveState(synced.statePath, state);
+        }
+      }
       return reply({ decision: "allow" });
     }
     if ((toolName === "invoke_subagent" || toolName === "Task") && isReadOnlySubagentCall(args)) {
@@ -1517,7 +1605,46 @@ function handlePreInvocation(payload) {
   });
 }
 
-function handleStop(payload) {
+function readTaskLogSnapshot(logPath) {
+  try {
+    if (!logPath || !fs.existsSync(logPath)) {
+      return { exists: false, size: 0, tailText: "" };
+    }
+    const stat = fs.statSync(logPath);
+    const size = Number(stat.size) || 0;
+    if (size <= 0) {
+      return { exists: true, size: 0, tailText: "" };
+    }
+    const readLen = Math.min(size, 2048);
+    const fd = fs.openSync(logPath, "r");
+    const buf = Buffer.alloc(readLen);
+    const bytesRead = fs.readSync(fd, buf, 0, readLen, size - readLen);
+    fs.closeSync(fd);
+    const tailText = buf.subarray(0, bytesRead).toString("utf8");
+    return { exists: true, size, tailText };
+  } catch (_) {
+    return { exists: false, size: 0, tailText: "" };
+  }
+}
+
+function isFastCompletionOrPromptTail(tailText) {
+  const s = String(tailText || "").slice(-600).trim();
+  if (!s) return false;
+  // 交互式确认或密码输入阻塞特征
+  if (/(?:\([yY]\/[nN]\)|\[[yY]\/[nN]\]|\bpassword\s*:|\bpassphrase\s*:|\bpress any key|\bcontinue\?\s*$|:\s*$)/i.test(s)) {
+    return true;
+  }
+  // 服务已就绪、健康检查 JSON 已返回或脚本已完成但子进程句柄未释放特征
+  if (/(?:\blistening on\b|\bserver running\b|\bstarted on\b|\bready in \d+|\bdaemon started\b|"status"\s*:\s*"(?:ok|healthy|running|online)"|"ok"\s*:\s*true|\bhttp:\/\/(?:127\.0\.0\.1|localhost):\d+)/i.test(s)) {
+    return true;
+  }
+  if (s.includes("{") && /\}\s*$/.test(s)) {
+    return true;
+  }
+  return false;
+}
+
+async function handleStop(payload) {
   try {
     if (payload && payload.transcriptPath) {
       const synced = syncTranscriptState(payload.transcriptPath, payload);
@@ -1528,7 +1655,91 @@ function handleStop(payload) {
         synced.state.approvedStepIndex = -1;
         synced.state.pendingGrants = createEmptyGrants();
         synced.state.approvedGrants = createEmptyGrants();
+        synced.state.activeBgTasks = {};
         saveState(synced.statePath, synced.state);
+        return reply({ decision: "allow" });
+      }
+
+      // 后台终端防卡死本地日志尾监控（仅当回合停止但存在未结束的非守护后台命令 NO_TOOL_CALL && fullyIdle === false 时激活）
+      if (reason === "NO_TOOL_CALL" && payload.fullyIdle === false && synced.state.activeBgTasks) {
+        const brainDir = path.dirname(path.dirname(path.dirname(path.normalize(String(payload.transcriptPath)))));
+        const pollMs = Math.max(100, Number(process.env.PLAN_GUARD_POLL_MS) || 1000);
+        const fastStagnantMs = Math.max(200, Number(process.env.PLAN_GUARD_FAST_STAGNANT_MS) || 4000);
+        const postOutputStagnantMs = Math.max(300, Number(process.env.PLAN_GUARD_POST_OUTPUT_STAGNANT_MS) || 10000);
+        const initialStagnantMs = Math.max(400, Number(process.env.PLAN_GUARD_STAGNANT_MS) || 15000);
+        const maxWatchMs = Math.max(1000, Number(process.env.PLAN_GUARD_MAX_WATCH_MS) || 165000);
+
+        const trackers = new Map();
+        for (const [tid, info] of Object.entries(synced.state.activeBgTasks)) {
+          if (!info || (Number(info.wakeupCount) || 0) >= 3) continue;
+          const resolvedLog = info.logPath || path.join(brainDir, ".system_generated", "tasks", tid + ".log");
+          const snap = readTaskLogSnapshot(resolvedLog);
+          trackers.set(tid, {
+            taskId: tid,
+            toolSummary: String(info.toolSummary || ""),
+            logPath: resolvedLog,
+            lastSize: snap.size,
+            lastGrowthAt: Date.now(),
+            tailText: snap.tailText
+          });
+        }
+
+        if (trackers.size > 0) {
+          const watchStart = Date.now();
+          while (Date.now() - watchStart < maxWatchMs) {
+            await new Promise((r) => setTimeout(r, pollMs));
+            const latest = syncTranscriptState(payload.transcriptPath, payload);
+            const activeMap = (latest.state && latest.state.activeBgTasks) || {};
+
+            for (const tid of Array.from(trackers.keys())) {
+              const latestInfo = activeMap[tid];
+              if (!latestInfo || (Number(latestInfo.wakeupCount) || 0) >= 3) {
+                trackers.delete(tid);
+              }
+            }
+            if (trackers.size === 0) {
+              return reply({ decision: "allow" });
+            }
+
+            const now = Date.now();
+            for (const [tid, tracker] of trackers.entries()) {
+              const snap = readTaskLogSnapshot(tracker.logPath);
+              if (snap.size > tracker.lastSize) {
+                // 只要终端还在持续输出新日志字节，立即重置静默计时器，绝不打断或误杀正常长耗时任务
+                tracker.lastSize = snap.size;
+                tracker.lastGrowthAt = now;
+                tracker.tailText = snap.tailText;
+                continue;
+              }
+
+              const stagnantMs = now - tracker.lastGrowthAt;
+              const isFastTail = snap.size > 0 && isFastCompletionOrPromptTail(snap.tailText);
+              const thresholdMs = isFastTail
+                ? fastStagnantMs
+                : (snap.size > 0 ? postOutputStagnantMs : initialStagnantMs);
+
+              if (stagnantMs >= thresholdMs) {
+                if (latest.state.activeBgTasks && latest.state.activeBgTasks[tid]) {
+                  latest.state.activeBgTasks[tid].wakeupCount = (Number(latest.state.activeBgTasks[tid].wakeupCount) || 0) + 1;
+                  saveState(latest.statePath, latest.state);
+                }
+                const userLang = detectUserLang(payload.transcriptPath);
+                const stagnantSec = Math.max(1, Math.round(stagnantMs / 1000));
+                const rawTail = String(snap.tailText || "").trim();
+                const tailSnippet = rawTail
+                  ? rawTail.slice(-500)
+                  : (userLang === "zh" ? "（暂无任何标准输出/错误输出）" : "(No stdout/stderr output yet)");
+                const summaryLabel = tracker.toolSummary ? " (" + tracker.toolSummary + ")" : "";
+                const zhWakeReason = "【后台终端防卡死巡检提醒】检测到后台终端任务 `" + tid + "`" + summaryLabel + " 的输出日志已连续静默 " + stagnantSec + " 秒无新增字节（可能原因：启动的后台服务/子进程未断开 stdout/stderr 管道句柄导致命令已执行完却一直挂在 running、或正等待交互输入/发生死锁）。\n最新日志尾部快照：\n```\n" + tailSnippet + "\n```\n请立即根据上方日志快照判断：1) 若命令实际已完成目标（如服务已重启并输出健康状态 JSON），请立即调用 `manage_task(Action: \"kill\", TaskId: \"" + tid + "\")` 收割挂起句柄并继续完成回复；2) 若需查看完整状态或发送输入，请调用 `manage_task(Action: \"status\" / \"send_input\", TaskId: \"" + tid + "\")`。";
+                const enWakeReason = "[Background Terminal Anti-Hang Watchdog] Background terminal task `" + tid + "`" + summaryLabel + " has produced 0 new log bytes for " + stagnantSec + "s (likely holding stdout/stderr handles open after completion, waiting for interactive prompt, or deadlocked).\nLatest log tail snapshot:\n```\n" + tailSnippet + "\n```\nPlease inspect the snapshot immediately: 1) If the command has already achieved its goal (e.g., server restarted and returned status JSON), call `manage_task(Action: \"kill\", TaskId: \"" + tid + "\")` to reap the hung process handle and finish your response; 2) Otherwise call `manage_task(Action: \"status\" / \"send_input\", TaskId: \"" + tid + "\")`.";
+                return reply({
+                  decision: "continue",
+                  reason: userLang === "zh" ? zhWakeReason : enWakeReason
+                });
+              }
+            }
+          }
+        }
       }
     }
   } catch (e) {}
@@ -1650,7 +1861,7 @@ async function main() {
   }
   if (mode === "pre-invocation") handlePreInvocation(payload);
   else if (mode === "post-tool") handlePostToolUse(payload);
-  else if (mode === "stop") handleStop(payload);
+  else if (mode === "stop") await handleStop(payload);
   else handlePreToolUse(payload);
 }
 
