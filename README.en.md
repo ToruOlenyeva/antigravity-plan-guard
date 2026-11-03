@@ -26,10 +26,11 @@
 
 ## ✨ Key Features
 
-- <b>Zero-Trust Write Interception</b>: Strictly monitors the `PreToolUse` lifecycle. All source code writes, file edits, and side-effect terminal commands are blocked prior to explicit user approval, returning structured remediation directives to the model.
+- <b>Full-Disk Read Freedom & Conversation-Isolated Workspace Locking</b>: Designed to pair seamlessly with Antigravity's native security presets (<b>Turbo / Auto</b> + <b>Allow Non-Workspace File Access</b>). During research, all read-only tools (`read_file`, `grep_search`, read-only terminal commands, `research` subagents) are allowed across the entire disk with zero popups; meanwhile, each conversation independently resolves and locks its own project workspace (`lockedWorkspaceRoots`) by `convId`, remaining 100% immune to foreground project switching.
+- <b>Implicit Scoped Permission Requests & Out-of-Workspace Boundary Control</b>: When proposing a plan in `ask_question`, the primary agent simply explains what will be modified (and which out-of-workspace project/directory is involved, without needing to list specific tool names or deep leaf file paths). In the background, Plan Guard automatically applies for mutation tool permissions and coarse-grained external path prefixes; once approved, declared targets are allowed while any undeclared out-of-workspace file writes or mutating commands are strictly blocked (`deny`).
 - <b>Same-Turn Explanation Enforcement</b>: Compels the primary agent to output a complete root-cause and architectural explanation in the chat body within the exact same turn as calling the `ask_question` modal.
 - <b>Buttonless Clean `Implementation Plan` Card Guard</b>: Bypasses the Go `proto3` zero-value omission quirk in `language_server.exe` by physically rewriting `"requestFeedback": false` in `.metadata.json` across `PreToolUse`, `PostToolUse`, and asynchronous post-write watchers, stripping the redundant blue `Proceed` (`Ctrl+Enter`) button while preserving the clean clickable plan card.
-- <b>Subagent Passthrough</b>: Automatically identifies delegated subagents via `transcript.jsonl` lineage inspection, granting friction-free execution to child agents once the primary agent secures approval.
+- <b>Subagent Passthrough & Scope Inheritance</b>: Automatically identifies delegated subagents via `transcript.jsonl` lineage inspection and inherits the parent conversation's locked workspace and approved external path prefixes, granting friction-free execution within the approved scope.
 - <b>Auto Language Detection for Chinese & English Users</b>: Automatically detects user dialog language (via latest user message in `transcript.jsonl` or system locale fallback) to deliver localized prompt instructions and action buttons (Chinese: "`确认执行 / 暂不修改`" vs English: "`Confirm & Execute / Cancel`").
 - <b>Zero External Dependencies</b>: Single-file vanilla Node.js implementation (`guard.cjs`) with zero npm dependencies and sub-millisecond evaluation latency.
 
@@ -39,13 +40,15 @@
 
 ```mermaid
 flowchart TD
-    A["Agent Triggers Tool Call (PreToolUse)"] --> B{"Is Target a Protected Write / Side-Effect Tool?"}
-    B -- "No (Read-Only Tool)" --> C["Allow Silently (allow)"]
-    B -- "Write implementation_plan.md Artifact" --> D["Enforce RequestFeedback: false & Allow"]
-    B -- "Write Source File / Side-Effect Command" --> E{"Is Delegated Subagent or Holds Valid Approval?"}
-    E -- "Yes (Approved / Subagent)" --> F["Allow Execution (allow)"]
-    E -- "No (Unauthorized Mutation)" --> G["Intercept & Block Call (deny)"]
-    G --> H["Compel Primary Agent to Explain in Chat Body & Call ask_question"]
+    A["Agent Triggers Tool Call (PreToolUse)"] --> B{"Is Tool Read-Only / Inspection Command?"}
+    B -- "Yes (Full-Disk Read)" --> C["Allow Silently Across Entire Disk (allow)"]
+    B -- "Write implementation_plan.md Artifact" --> D["Enforce requestFeedback: false & Allow"]
+    B -- "Call ask_question to Propose Plan" --> E["Audit Chat Body + Auto-Extract Tool & External Path Grants"]
+    B -- "Write Business File / Mutating Command" --> F{"Is Approved or Delegated Subagent?"}
+    F -- "No (Unauthorized Mutation)" --> G["Intercept & Block (deny), Prompt ask_question"]
+    F -- "Yes (Approved / Subagent)" --> H{"Is Target Inside Locked Workspace or Approved External Prefix?"}
+    H -- "Yes (Within Approved Scope)" --> I["Allow Execution (allow)"]
+    H -- "No (Undeclared Out-of-Workspace Path)" --> J["Block Out-of-Bounds Mutation (deny) & Require Scope Application"]
 ```
 
 ---

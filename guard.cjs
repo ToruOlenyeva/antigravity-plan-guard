@@ -46,6 +46,14 @@ function getStatePath(transcriptPath) {
   return path.join(os.tmpdir(), "antigravity-plan-guard-state.json");
 }
 
+function createEmptyGrants() {
+  return {
+    allowMutatingTools: false,
+    allowWorkspaceWrite: false,
+    externalPathPrefixes: []
+  };
+}
+
 function createInitialState() {
   return {
     stateVersion: 2,
@@ -60,7 +68,12 @@ function createInitialState() {
     pendingToolCalls: [],
     pendingStepIndex: -1,
     hasUserInput: false,
-    hasParentSenderMessage: false
+    hasParentSenderMessage: false,
+    parentConvId: "",
+    lockedProjectId: "",
+    lockedWorkspaceRoots: [],
+    pendingGrants: createEmptyGrants(),
+    approvedGrants: createEmptyGrants()
   };
 }
 
@@ -232,8 +245,8 @@ function isPureReadOnlyCommand(cmd) {
     return false;
   }
 
-  // 3. 本地纯只读查询命令白名单（支持 git -C <path> 前缀）
-  const localSafeReads = /^(git\s+(-c\s+("[^"]+"|'[^']+'|\S+)\s+)?(status|log|diff|branch|show)|dir|ls|get-childitem|cat|type|get-content|head|tail|grep|select-string|findstr|npm\s+run\s+test:docs|npm\s+test|cargo\s+check)(\s|$)/i;
+  // 3. 本地纯只读查询与语法检查命令白名单（支持 git -C <path> 前缀与 node -c 语法校验）
+  const localSafeReads = /^(git\s+(-c\s+("[^"]+"|'[^']+'|\S+)\s+)?(status|log|diff|branch|show)|node\s+(-c|--check)|dir|ls|get-childitem|cat|type|get-content|head|tail|grep|select-string|findstr|npm\s+run\s+test:docs|npm\s+test|cargo\s+check)(\s|$)/i;
   if (localSafeReads.test(cNoStdErr)) return true;
 
   return false;
@@ -385,8 +398,572 @@ function isReadOnlySubagentCall(args) {
   });
 }
 
-function syncTranscriptState(rawTranscriptPath) {
+function resolveHostHomeDir() {
+  const normalized = __dirname.replace(/\\/g, "/");
+  const geminiIdx = normalized.toLowerCase().indexOf("/.gemini/");
+  if (geminiIdx > 0) {
+    const candidate = path.normalize(__dirname.slice(0, geminiIdx));
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  const os = require("os");
+  return os.homedir();
+}
+
+function normalizePathForMatch(str) {
+  if (!str || typeof str !== "string") return "";
+  let p = str.trim().replace(/^file:\/\/\//i, "").replace(/^file:\/\//i, "");
+  try { p = decodeURIComponent(p); } catch (_) {}
+  p = p.replace(/\\/g, "/").replace(/^([a-zA-Z])%3A/i, "$1:").replace(/^\/([a-zA-Z]:)/, "$1");
+  while (p.endsWith("/")) p = p.slice(0, -1);
+  return p.toLowerCase();
+}
+
+function isPathInsidePrefixes(normTarget, prefixes) {
+  if (!normTarget || !Array.isArray(prefixes) || prefixes.length === 0) return false;
+  for (const rawPrefix of prefixes) {
+    const p = normalizePathForMatch(rawPrefix);
+    if (!p) continue;
+    if (normTarget === p || normTarget.startsWith(p + "/")) return true;
+  }
+  return false;
+}
+
+function compactPathPrefixes(prefixes) {
+  const unique = Array.from(new Set((prefixes || []).map(normalizePathForMatch).filter(Boolean)));
+  unique.sort((a, b) => a.length - b.length);
+  const compacted = [];
+  for (const p of unique) {
+    if (!isPathInsidePrefixes(p, compacted)) {
+      compacted.push(p);
+    }
+  }
+  return compacted;
+}
+
+function mergeGrants(target, source) {
+  const t = target || createEmptyGrants();
+  const s = source || createEmptyGrants();
+  return {
+    allowMutatingTools: Boolean(t.allowMutatingTools || s.allowMutatingTools),
+    allowWorkspaceWrite: Boolean(t.allowWorkspaceWrite || s.allowWorkspaceWrite),
+    externalPathPrefixes: compactPathPrefixes([
+      ...(Array.isArray(t.externalPathPrefixes) ? t.externalPathPrefixes : []),
+      ...(Array.isArray(s.externalPathPrefixes) ? s.externalPathPrefixes : [])
+    ])
+  };
+}
+
+let _cachedCatalog = null;
+function loadKnownProjectCatalog(homeDir) {
+  if (_cachedCatalog) return _cachedCatalog;
+  const h = homeDir || resolveHostHomeDir();
+  const profilesPath = path.join(h, ".gemini", "config", "project-plugin-profiles.json");
+  const projectsDir = path.join(h, ".gemini", "config", "projects");
+  const projectMap = {};
+  const allKnownProjectRoots = [];
+
+  const registerProject = (id, name, rawPaths) => {
+    if (!id || id === "__meta__" || id === "__default__") return;
+    if (!projectMap[id]) {
+      projectMap[id] = { id, name: name || id, paths: [] };
+    } else if (name && (!projectMap[id].name || projectMap[id].name === id)) {
+      projectMap[id].name = name;
+    }
+    if (Array.isArray(rawPaths)) {
+      for (const rp of rawPaths) {
+        const np = normalizePathForMatch(rp);
+        if (np && !projectMap[id].paths.includes(np)) {
+          projectMap[id].paths.push(np);
+          allKnownProjectRoots.push({ id, name: projectMap[id].name, root: np });
+        }
+      }
+    }
+  };
+
+  try {
+    let profiles = null;
+    if (fs.existsSync(profilesPath)) {
+      try { profiles = JSON.parse(fs.readFileSync(profilesPath, "utf8")); } catch (_) {}
+    }
+    if (!profiles && fs.existsSync(profilesPath + ".bak")) {
+      try { profiles = JSON.parse(fs.readFileSync(profilesPath + ".bak", "utf8")); } catch (_) {}
+    }
+    if (profiles && typeof profiles === "object") {
+      for (const [k, v] of Object.entries(profiles)) {
+        if (k !== "__meta__" && k !== "__default__" && v && typeof v === "object") {
+          registerProject(k, v.name || k, v.paths);
+        }
+      }
+    }
+  } catch (_) {}
+
+  try {
+    if (fs.existsSync(projectsDir)) {
+      const files = fs.readdirSync(projectsDir).filter((f) => f.endsWith(".json"));
+      for (const f of files) {
+        try {
+          const pData = JSON.parse(fs.readFileSync(path.join(projectsDir, f), "utf8"));
+          const id = pData.id || f.replace(/\.json$/, "");
+          const name = pData.name || pData.title || id;
+          const paths = [];
+          if (Array.isArray(pData.projectResources)) {
+            for (const r of pData.projectResources) {
+              if (typeof r === "string") paths.push(r);
+              else if (r && (r.uri || r.path || r.resourceUri)) paths.push(r.uri || r.path || r.resourceUri);
+            }
+          }
+          if (Array.isArray(pData.paths)) paths.push(...pData.paths);
+          registerProject(id, name, paths);
+        } catch (_) {}
+      }
+    }
+  } catch (_) {}
+
+  _cachedCatalog = { projectMap, allKnownProjectRoots };
+  return _cachedCatalog;
+}
+
+function extractConvId(payload, rawTranscriptPath) {
+  let convId = String(
+    (payload && (payload.conversationId || payload.conversation_id || payload.trajectoryId || payload.trajectory_id || payload.cascadeId)) || ""
+  ).trim();
+  if (!convId) {
+    const tPath = rawTranscriptPath || (payload && (payload.transcriptPath || payload.transcript_path)) || "";
+    if (tPath) {
+      const m = String(tPath).replace(/\\/g, "/").match(/\/brain\/([0-9a-f-]{36})\//i);
+      if (m && m[1]) convId = m[1];
+    }
+  }
+  return convId;
+}
+
+function resolveAndLockWorkspaceRoots(payload, state, statePath, rawTranscriptPath) {
+  const homeDir = resolveHostHomeDir();
+  const convId = extractConvId(payload, rawTranscriptPath);
+
+  // 1. 若当前会话是子智能体且记录了 parentConvId，直接从父会话 guard-state.json 继承固化的工作区与已批准权限
+  const isSubagent = !state.hasUserInput && state.hasParentSenderMessage;
+  if (isSubagent && state.parentConvId) {
+    try {
+      const parentStatePath = path.join(homeDir, ".gemini", "antigravity", "brain", state.parentConvId, ".system_generated", "logs", "guard-state.json");
+      if (fs.existsSync(parentStatePath)) {
+        const parentState = loadState(parentStatePath);
+        let changed = false;
+        if (parentState.lockedProjectId && state.lockedProjectId !== parentState.lockedProjectId) {
+          state.lockedProjectId = parentState.lockedProjectId;
+          changed = true;
+        }
+        if (Array.isArray(parentState.lockedWorkspaceRoots) && parentState.lockedWorkspaceRoots.length > 0) {
+          const mergedRoots = compactPathPrefixes([...(state.lockedWorkspaceRoots || []), ...parentState.lockedWorkspaceRoots]);
+          if (mergedRoots.length !== (state.lockedWorkspaceRoots || []).length) {
+            state.lockedWorkspaceRoots = mergedRoots;
+            changed = true;
+          }
+        }
+        const mergedApproved = mergeGrants(state.approvedGrants, mergeGrants(parentState.approvedGrants, parentState.pendingGrants));
+        if (
+          mergedApproved.allowMutatingTools !== state.approvedGrants.allowMutatingTools ||
+          mergedApproved.allowWorkspaceWrite !== state.approvedGrants.allowWorkspaceWrite ||
+          mergedApproved.externalPathPrefixes.length !== (state.approvedGrants.externalPathPrefixes || []).length
+        ) {
+          state.approvedGrants = mergedApproved;
+          changed = true;
+        }
+        if (changed && statePath) saveState(statePath, state);
+      }
+    } catch (_) {}
+  }
+
+  // 2. 若当前会话已固化 lockedWorkspaceRoots，直接返回（100% 免疫前台窗口切换）
+  if (Array.isArray(state.lockedWorkspaceRoots) && state.lockedWorkspaceRoots.length > 0) {
+    return state.lockedWorkspaceRoots;
+  }
+
+  const catalog = loadKnownProjectCatalog(homeDir);
+  const profilesPath = path.join(homeDir, ".gemini", "config", "project-plugin-profiles.json");
+  const convDbPath = path.join(homeDir, ".gemini", "antigravity", "conversation_summaries.db");
+
+  let projectId = String(state.lockedProjectId || (payload && (payload.projectId || payload.project_id)) || "").trim();
+
+  // 3. 严格通过 convId 从 conversation_summaries.db 查询本会话归属的 projectId（绝不读取前台焦点状态）
+  if (!projectId && convId && fs.existsSync(convDbPath)) {
+    try {
+      const { DatabaseSync } = require("node:sqlite");
+      const db = new DatabaseSync(convDbPath, { readOnly: true, open: true });
+      const row = db.prepare("SELECT project_id FROM conversation_summaries WHERE conversation_id = ?").get(convId);
+      db.close();
+      if (row && row.project_id) projectId = String(row.project_id).trim();
+    } catch (_) {}
+  }
+
+  // 4. 次选从 profiles.__meta__.convProjectMap[convId] 精确查表（禁止读取 lastActiveProjectId / lastSidecarProjectId）
+  if (!projectId && convId && fs.existsSync(profilesPath)) {
+    try {
+      const profiles = JSON.parse(fs.readFileSync(profilesPath, "utf8"));
+      if (profiles && profiles.__meta__ && profiles.__meta__.convProjectMap && profiles.__meta__.convProjectMap[convId]) {
+        projectId = String(profiles.__meta__.convProjectMap[convId]).trim();
+      }
+    } catch (_) {}
+  }
+
+  const collectedRoots = [];
+  if (projectId && catalog.projectMap[projectId] && Array.isArray(catalog.projectMap[projectId].paths)) {
+    collectedRoots.push(...catalog.projectMap[projectId].paths);
+  }
+
+  // 5. 收集当前会话载荷自身携带的 workspacePaths / workspaceUris（兜底支持尚未入库的新建会话）
+  if (payload) {
+    const rawUris = [];
+    if (Array.isArray(payload.workspacePaths)) rawUris.push(...payload.workspacePaths);
+    if (Array.isArray(payload.workspace_paths)) rawUris.push(...payload.workspace_paths);
+    if (Array.isArray(payload.workspaceUris)) rawUris.push(...payload.workspaceUris);
+    if (Array.isArray(payload.workspace_uris)) rawUris.push(...payload.workspace_uris);
+    if (typeof payload.workspaceUri === "string") rawUris.push(payload.workspaceUri);
+    if (typeof payload.cwd === "string" && collectedRoots.length === 0) rawUris.push(payload.cwd);
+
+    for (const u of rawUris) {
+      const nu = normalizePathForMatch(u);
+      if (!nu) continue;
+      if (!projectId) {
+        let bestId = "";
+        let bestScore = -1;
+        for (const item of catalog.allKnownProjectRoots) {
+          const score = nu === item.root ? 10000 + item.root.length : (nu.startsWith(item.root + "/") ? item.root.length : -1);
+          if (score > bestScore) {
+            bestScore = score;
+            bestId = item.id;
+          }
+        }
+        if (bestId) {
+          projectId = bestId;
+          if (catalog.projectMap[bestId]) {
+            collectedRoots.push(...catalog.projectMap[bestId].paths);
+          }
+        }
+      }
+      if (collectedRoots.length === 0 || !projectId) {
+        collectedRoots.push(nu);
+      }
+    }
+  }
+
+  const finalRoots = compactPathPrefixes(collectedRoots);
+  let dirty = false;
+  if (projectId && state.lockedProjectId !== projectId) {
+    state.lockedProjectId = projectId;
+    dirty = true;
+  }
+  if (finalRoots.length > 0) {
+    state.lockedWorkspaceRoots = finalRoots;
+    dirty = true;
+  }
+  if (dirty && statePath) {
+    saveState(statePath, state);
+  }
+  return state.lockedWorkspaceRoots || [];
+}
+
+function promoteToCoarseExternalPrefix(normTarget, workspaceRoots, catalog, homeDir) {
+  if (!normTarget) return "";
+  if (isWhitelistedTarget(normTarget)) return "";
+  if (isPathInsidePrefixes(normTarget, workspaceRoots)) return "";
+
+  const normHome = normalizePathForMatch(homeDir || resolveHostHomeDir());
+
+  // 1. 若命中已知外部项目根目录（或其子路径），自动提升为该外部项目根目录（除非该外部项目根目录反过来包含了当前工作区）
+  let bestKnownRoot = "";
+  for (const item of (catalog && catalog.allKnownProjectRoots) || []) {
+    if (!item || !item.root) continue;
+    if (isPathInsidePrefixes(item.root, workspaceRoots)) continue;
+    const wrapsCurrentWorkspace = (workspaceRoots || []).some((w) => w === item.root || w.startsWith(item.root + "/"));
+    if (wrapsCurrentWorkspace) continue;
+    if (normTarget === item.root || normTarget.startsWith(item.root + "/")) {
+      if (item.root.length > bestKnownRoot.length) {
+        bestKnownRoot = item.root;
+      }
+    }
+  }
+  if (bestKnownRoot) return bestKnownRoot;
+
+  // 2. 若命中 ~/.gemini/config/plugins/<pluginName>，且当前工作区不是 plugins 根目录，提升到插件目录级
+  const pluginsRoot = normHome ? normHome + "/.gemini/config/plugins" : "";
+  if (pluginsRoot && normTarget.startsWith(pluginsRoot + "/") && !isPathInsidePrefixes(pluginsRoot, workspaceRoots)) {
+    const rest = normTarget.slice(pluginsRoot.length + 1);
+    const seg = rest.split("/")[0];
+    if (seg) return pluginsRoot + "/" + seg;
+  }
+
+  // 3. 若本身是目录或无扩展名路径，直接以该目录作为前缀；若是具体文件路径，提升到其父目录（严禁提升到盘符根或用户主目录根）
+  let isDir = false;
+  try {
+    if (fs.existsSync(normTarget) && fs.statSync(normTarget).isDirectory()) {
+      isDir = true;
+    }
+  } catch (_) {}
+
+  const base = path.posix.basename(normTarget);
+  const looksLikeFile = !isDir && /\.[a-z0-9]{1,8}$/i.test(base);
+  if (looksLikeFile) {
+    const parentDir = path.posix.dirname(normTarget);
+    const isDriveRoot = /^[a-z]:$/i.test(parentDir);
+    const isHomeRoot = normHome && parentDir === normHome;
+    if (parentDir && parentDir !== "." && !isDriveRoot && !isHomeRoot) {
+      return parentDir;
+    }
+  }
+  return normTarget;
+}
+
+function cleanCandidatePathToken(raw) {
+  if (!raw || typeof raw !== "string") return "";
+  let s = raw.trim();
+  s = s.replace(/#L\d+(?:-L?\d+)?$/i, "");
+  s = s.replace(/[),.;:!?'"`\]>]+$/g, "");
+  return s.trim();
+}
+
+function extractScopeGrantsFromPlan(planTexts, workspaceRoots, homeDir) {
+  const h = homeDir || resolveHostHomeDir();
+  const normHome = normalizePathForMatch(h);
+  const catalog = loadKnownProjectCatalog(h);
+  const combinedText = (Array.isArray(planTexts) ? planTexts : [planTexts])
+    .filter((t) => typeof t === "string" && t.length > 0)
+    .join("\n");
+
+  const rawCandidates = [];
+
+  // 1. 提取 file:/// URI
+  const fileUriRegex = /file:\/\/\/[^\s"'`<>|)\]]+/gi;
+  let m;
+  while ((m = fileUriRegex.exec(combinedText)) !== null) {
+    rawCandidates.push(cleanCandidatePathToken(m[0]));
+  }
+
+  // 2. 提取带引号与不带引号的 Windows 盘符路径（支持 D:\Visual Studio\private-projects 等含空格目录）
+  const quotedDriveRegex = /["'`(]([a-zA-Z]:[\\/][^"'`\r\n<>|)]+)["'`)]/g;
+  while ((m = quotedDriveRegex.exec(combinedText)) !== null) {
+    rawCandidates.push(cleanCandidatePathToken(m[1]));
+  }
+  const bareDriveRegex = /\b([a-zA-Z]:[\\/][^\s"'`<>|)\]]+)/g;
+  while ((m = bareDriveRegex.exec(combinedText)) !== null) {
+    rawCandidates.push(cleanCandidatePathToken(m[1]));
+  }
+
+  // 3. 提取 ~/ 或 $env:USERPROFILE / %USERPROFILE% 相对主目录路径
+  if (normHome) {
+    const homeRelRegex = /(?:~|\$env:USERPROFILE|%USERPROFILE%)[\\/]([^\s"'`<>|)\]]+)/gi;
+    while ((m = homeRelRegex.exec(combinedText)) !== null) {
+      rawCandidates.push(normHome + "/" + cleanCandidatePathToken(m[1]));
+    }
+  }
+
+  // 4. 识别方案中直接提及的已知外部项目名或目录名（用户/AI 无需写详细完整路径即可申请对应外部项目权限）
+  const lowerText = combinedText.toLowerCase();
+  for (const item of catalog.allKnownProjectRoots) {
+    if (!item || !item.root) continue;
+    if (isPathInsidePrefixes(item.root, workspaceRoots)) continue;
+    const baseName = path.posix.basename(item.root);
+    const idToken = String(item.id || "").toLowerCase();
+    const nameToken = String(item.name || "").toLowerCase();
+    if (
+      (baseName && baseName.length >= 3 && lowerText.includes(baseName)) ||
+      (idToken && idToken.length >= 3 && lowerText.includes(idToken)) ||
+      (nameToken && nameToken.length >= 2 && lowerText.includes(nameToken))
+    ) {
+      rawCandidates.push(item.root);
+    }
+  }
+
+  const externalPrefixes = [];
+  for (const cand of rawCandidates) {
+    const norm = normalizePathForMatch(cand);
+    if (!norm || !/^[a-z]:\//i.test(norm)) continue;
+    if (isWhitelistedTarget(norm)) continue;
+    if (isPathInsidePrefixes(norm, workspaceRoots)) continue;
+    const promoted = promoteToCoarseExternalPrefix(norm, workspaceRoots, catalog, h);
+    if (promoted) {
+      externalPrefixes.push(promoted);
+    }
+  }
+
+  return {
+    allowMutatingTools: true,
+    allowWorkspaceWrite: true,
+    externalPathPrefixes: compactPathPrefixes(externalPrefixes)
+  };
+}
+
+function collectAskQuestionTexts(toolCalls, assistantContent) {
+  const texts = [];
+  if (typeof assistantContent === "string" && assistantContent.trim()) {
+    texts.push(assistantContent.trim());
+  }
+  if (!Array.isArray(toolCalls)) return texts;
+  for (const tc of toolCalls) {
+    if (!tc || tc.name !== "ask_question" || !tc.args) continue;
+    const qs = parseToolArg(tc.args.questions);
+    if (Array.isArray(qs)) {
+      for (const q of qs) {
+        if (q && typeof q.question === "string" && q.question.trim()) {
+          texts.push(q.question.trim());
+        }
+      }
+    } else if (typeof tc.args.questions === "string") {
+      texts.push(tc.args.questions);
+    }
+  }
+  return texts;
+}
+
+function readCurrentConversationPlanArtifact(rawTranscriptPath, shouldIncludeArtifact) {
+  if (!shouldIncludeArtifact || !rawTranscriptPath) return "";
+  try {
+    const norm = String(rawTranscriptPath).replace(/\\/g, "/");
+    const m = norm.match(/^(.*?\/brain\/[0-9a-f-]{36})\//i);
+    if (m && m[1]) {
+      const planPath = path.join(m[1], "implementation_plan.md");
+      if (fs.existsSync(planPath)) {
+        return fs.readFileSync(planPath, "utf8");
+      }
+    }
+  } catch (_) {}
+  return "";
+}
+
+function isBenignSystemOrRuntimePath(normPath, homeDir) {
+  if (!normPath) return true;
+  if (isWhitelistedTarget(normPath)) return true;
+  const normHome = normalizePathForMatch(homeDir || resolveHostHomeDir());
+  const os = require("os");
+  const normTmp = normalizePathForMatch(os.tmpdir());
+  if (normTmp && (normPath === normTmp || normPath.startsWith(normTmp + "/"))) return true;
+  if (
+    normPath.startsWith("c:/windows/") ||
+    normPath === "c:/windows" ||
+    normPath.startsWith("c:/program files/") ||
+    normPath.startsWith("c:/program files (x86)/") ||
+    normPath.includes("/appdata/local/temp") ||
+    normPath.includes("/appdata/local/programs/") ||
+    normPath.includes("/.gemini/antigravity/brain/")
+  ) {
+    return true;
+  }
+  if (normHome) {
+    if (
+      normPath.startsWith(normHome + "/.cargo/bin") ||
+      normPath.startsWith(normHome + "/.rustup") ||
+      normPath.startsWith(normHome + "/scoop/") ||
+      normPath.startsWith(normHome + "/nvm/")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function extractCommandTargetPaths(cmd, homeDir) {
+  if (!cmd || typeof cmd !== "string") return [];
+  const h = homeDir || resolveHostHomeDir();
+  const normHome = normalizePathForMatch(h);
+  const candidates = [];
+
+  const quotedDriveRegex = /["']([a-zA-Z]:[\\/][^"'\r\n<>|]+)["']/g;
+  let m;
+  while ((m = quotedDriveRegex.exec(cmd)) !== null) {
+    candidates.push(cleanCandidatePathToken(m[1]));
+  }
+
+  const unquotedCmd = cmd.replace(quotedDriveRegex, " ");
+  const bareDriveRegex = /\b([a-zA-Z]:[\\/][^\s"'`<>|;)]+)/g;
+  while ((m = bareDriveRegex.exec(unquotedCmd)) !== null) {
+    candidates.push(cleanCandidatePathToken(m[1]));
+  }
+
+  if (normHome) {
+    const homeRelRegex = /(?:~|\$env:USERPROFILE|%USERPROFILE%)[\\/]([^\s"'`<>|;)]+)/gi;
+    while ((m = homeRelRegex.exec(cmd)) !== null) {
+      candidates.push(normHome + "/" + cleanCandidatePathToken(m[1]));
+    }
+  }
+
+  const results = [];
+  for (const c of candidates) {
+    const norm = normalizePathForMatch(c);
+    if (!norm || !/^[a-z]:\//i.test(norm)) continue;
+    if (isBenignSystemOrRuntimePath(norm, h)) continue;
+    if (!results.includes(norm)) results.push(norm);
+  }
+  return results;
+}
+
+function verifyToolCallAgainstApprovedGrants(toolName, args, workspaceRoots, effectiveGrants, homeDir, userLang) {
+  const roots = Array.isArray(workspaceRoots) ? workspaceRoots : [];
+  const grants = effectiveGrants || createEmptyGrants();
+  const extPrefixes = Array.isArray(grants.externalPathPrefixes) ? grants.externalPathPrefixes : [];
+
+  if (WRITE_FILE_TOOLS.has(toolName)) {
+    const rawTarget = extractTargetFileFromArgs(args);
+    if (!rawTarget || isWhitelistedTarget(rawTarget)) {
+      return { allowed: true };
+    }
+    const normTarget = normalizePathForMatch(rawTarget);
+    if (roots.length > 0 && normTarget && /^[a-z]:\//i.test(normTarget)) {
+      const inWorkspace = isPathInsidePrefixes(normTarget, roots);
+      const inApprovedExternal = isPathInsidePrefixes(normTarget, extPrefixes);
+      if (!inWorkspace && !inApprovedExternal) {
+        const wsLabel = roots.join(", ");
+        const extLabel = extPrefixes.length > 0 ? extPrefixes.join(", ") : (userLang === "zh" ? "（无）" : "(none)");
+        return {
+          allowed: false,
+          reason: userLang === "zh"
+            ? "【方案门禁拦截 · 工作区外未申报路径修改】目标文件 \"" + rawTarget + "\" 位于当前会话固化的工作区（" + wsLabel + "）之外，且不在本轮方案已申请获批的工作区外路径范围（" + extLabel + "）内！若需修改工作区外的内容，请先在同一回合输出聊天正文解释（content），并调用 ask_question 在方案中向用户说明要修改哪些工作区外的项目或目录（无需写详细具体子文件路径，后台会自动申请该目录权限），待用户确认后再执行修改。"
+            : "[Plan Guard Intercept | Undeclared Out-of-Workspace Modification] Target file \"" + rawTarget + "\" is outside the conversation's locked workspace (" + wsLabel + ") and is not covered by the approved out-of-workspace path prefixes (" + extLabel + ")! To modify out-of-workspace files, first output chat explanation (content) and call ask_question to declare which external project/directory will be modified (coarse directory path is sufficient; detailed leaf paths are not required), and wait for user approval."
+        };
+      }
+    }
+    return { allowed: true };
+  }
+
+  if (EXEC_CMD_TOOLS.has(toolName)) {
+    const cmd = String(args.CommandLine || args.command || "").trim();
+    if (!cmd || isPureReadOnlyCommand(cmd)) {
+      return { allowed: true };
+    }
+    if (roots.length > 0) {
+      const targetPaths = extractCommandTargetPaths(cmd, homeDir);
+      for (const tp of targetPaths) {
+        const inWorkspace = isPathInsidePrefixes(tp, roots);
+        const inApprovedExternal = isPathInsidePrefixes(tp, extPrefixes);
+        if (!inWorkspace && !inApprovedExternal) {
+          const wsLabel = roots.join(", ");
+          const extLabel = extPrefixes.length > 0 ? extPrefixes.join(", ") : (userLang === "zh" ? "（无）" : "(none)");
+          return {
+            allowed: false,
+            reason: userLang === "zh"
+              ? "【方案门禁拦截 · 终端命令涉及未申报的工作区外路径】检测到非只读终端命令操作了工作区（" + wsLabel + "）之外且未在本轮方案中申请获批的路径 \"" + tp + "\"（已批准外部范围：" + extLabel + "）！若需跨工作区执行同步、写入或提交，请先在聊天正文说明并通过 ask_question 申请该工作区外目录权限后再执行。"
+              : "[Plan Guard Intercept | Terminal Command Targets Undeclared External Path] Mutating command references path \"" + tp + "\" outside the locked workspace (" + wsLabel + ") and outside approved external prefixes (" + extLabel + ")! Please declare the external directory in ask_question and obtain user approval before executing."
+          };
+        }
+      }
+    }
+    return { allowed: true };
+  }
+
+  return { allowed: true };
+}
+
+function backfillLegacyApprovedGrantsIfNeeded(state, statePath, rawTranscriptPath, workspaceRoots, homeDir) {
+  if (!state || !state.approved) return;
+  if (state.approvedGrants && state.approvedGrants.allowMutatingTools) return;
+  const planText = readCurrentConversationPlanArtifact(rawTranscriptPath, true);
+  const extracted = extractScopeGrantsFromPlan([planText], workspaceRoots, homeDir);
+  state.approvedGrants = mergeGrants(state.approvedGrants, mergeGrants(state.pendingGrants, extracted));
+  if (statePath) saveState(statePath, state);
+}
+
+function syncTranscriptState(rawTranscriptPath, payload) {
   const statePath = getStatePath(rawTranscriptPath);
+  const homeDir = resolveHostHomeDir();
   let tPath = rawTranscriptPath || "";
   const fullPath = tPath.endsWith("transcript.jsonl")
     ? tPath.replace(/transcript\.jsonl$/, "transcript_full.jsonl")
@@ -396,10 +973,13 @@ function syncTranscriptState(rawTranscriptPath) {
     if (fs.existsSync(compact)) tPath = compact;
   }
   if (!tPath || !fs.existsSync(tPath)) {
-    return { exists: false, statePath, state: createInitialState() };
+    const initState = createInitialState();
+    resolveAndLockWorkspaceRoots(payload, initState, null, rawTranscriptPath);
+    return { exists: false, statePath, state: initState };
   }
 
   let state = loadState(statePath);
+  const workspaceRoots = resolveAndLockWorkspaceRoots(payload, state, statePath, rawTranscriptPath);
   const fd = fs.openSync(tPath, "r");
   const stats = fs.fstatSync(fd);
 
@@ -412,6 +992,7 @@ function syncTranscriptState(rawTranscriptPath) {
 
   if (canReadDelta && state.lastScannedOffset === stats.size) {
     fs.closeSync(fd);
+    backfillLegacyApprovedGrantsIfNeeded(state, statePath, rawTranscriptPath, workspaceRoots, homeDir);
     return { exists: true, statePath, state };
   }
 
@@ -419,7 +1000,11 @@ function syncTranscriptState(rawTranscriptPath) {
   if (canReadDelta) {
     readStart = state.lastScannedOffset;
   } else {
+    const preservedProjectId = state.lockedProjectId || "";
+    const preservedRoots = Array.isArray(state.lockedWorkspaceRoots) ? state.lockedWorkspaceRoots : [];
     state = createInitialState();
+    state.lockedProjectId = preservedProjectId;
+    state.lockedWorkspaceRoots = preservedRoots;
     if (stats.size > 1048576) {
       const headSize = Math.min(stats.size, 65536);
       const headBuf = Buffer.alloc(headSize);
@@ -427,6 +1012,11 @@ function syncTranscriptState(rawTranscriptPath) {
       const headStr = headBuf.toString("utf-8");
       if (/"source"\s*:\s*"USER_EXPLICIT"|"type"\s*:\s*"USER_INPUT"/.test(headStr)) {
         state.hasUserInput = true;
+      }
+      const parentMatch = headStr.match(/\[Message\]\s+timestamp=[^\r\n]+?\s+sender=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+      if (parentMatch && parentMatch[1]) {
+        state.hasParentSenderMessage = true;
+        state.parentConvId = parentMatch[1];
       }
       readStart = stats.size - 1048576;
     }
@@ -475,11 +1065,12 @@ function syncTranscriptState(rawTranscriptPath) {
     if (e.source === "USER_EXPLICIT" || e.type === "USER_INPUT") {
       state.hasUserInput = true;
     }
-    if (
-      (e.type === "SYSTEM_MESSAGE" || e.source === "SYSTEM") &&
-      /\[Message\]\s+timestamp=[^\r\n]+?\s+sender=[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(content)
-    ) {
-      state.hasParentSenderMessage = true;
+    if (e.type === "SYSTEM_MESSAGE" || e.source === "SYSTEM") {
+      const senderMatch = content.match(/\[Message\]\s+timestamp=[^\r\n]+?\s+sender=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+      if (senderMatch && senderMatch[1]) {
+        state.hasParentSenderMessage = true;
+        if (!state.parentConvId) state.parentConvId = senderMatch[1];
+      }
     }
 
     if (state.approved && state.approvedStepIndex >= 0 && stepIdx >= 0 && stepIdx <= state.approvedStepIndex) {
@@ -488,15 +1079,18 @@ function syncTranscriptState(rawTranscriptPath) {
       continue;
     }
 
-    // 熔断线 3：用户在界面手动点击 Stop / Cancel 中断执行 -> 立即撤权
+    // 熔断线 3：用户在界面手动点击 Stop / Cancel 中断执行 -> 立即撤权并清空已批准权限
     if (e.status === "CANCELED" || e.status === "CANCELLED") {
       state.approved = false;
       state.approvedStepIndex = -1;
       state.lastResetReason = "canceled";
+      state.pendingGrants = createEmptyGrants();
+      state.approvedGrants = createEmptyGrants();
     }
 
-    // 熔断线 1：新用户消息输入 -> 除非明确包含直接授权词，否则立即撤权归零
+    // 熔断线 1：新用户消息输入 -> 除非明确包含直接授权词，否则立即撤权并清空权限范围
     if (e.source === "USER_EXPLICIT" || e.type === "USER_INPUT") {
+      const hadPlan = state.hasPlanSinceLastReset;
       state.pendingToolCalls = [];
       state.pendingStepIndex = -1;
       state.hasPlanSinceLastReset = false;
@@ -507,10 +1101,16 @@ function syncTranscriptState(rawTranscriptPath) {
         state.approved = true;
         state.approvedStepIndex = stepIdx;
         state.lastResetReason = "";
+        const planArtifactText = readCurrentConversationPlanArtifact(rawTranscriptPath, hadPlan);
+        const autoGrants = extractScopeGrantsFromPlan([planArtifactText], workspaceRoots, homeDir);
+        state.approvedGrants = mergeGrants(state.approvedGrants, mergeGrants(state.pendingGrants, autoGrants));
+        state.pendingGrants = createEmptyGrants();
       } else {
         state.approved = false;
         state.approvedStepIndex = -1;
         state.lastResetReason = "user_input";
+        state.pendingGrants = createEmptyGrants();
+        state.approvedGrants = createEmptyGrants();
       }
       lastValidOffset = readStart + nextOffsetInBuf;
       offsetInBuf = nextOffsetInBuf;
@@ -523,6 +1123,9 @@ function syncTranscriptState(rawTranscriptPath) {
       if (isUserAuthorized(content)) {
         state.approved = true;
         if (stepIdx >= 0) state.approvedStepIndex = stepIdx;
+        const planArtifactText = readCurrentConversationPlanArtifact(rawTranscriptPath, true);
+        const autoGrants = extractScopeGrantsFromPlan([planArtifactText], workspaceRoots, homeDir);
+        state.approvedGrants = mergeGrants(state.approvedGrants, mergeGrants(state.pendingGrants, autoGrants));
       }
       lastValidOffset = readStart + nextOffsetInBuf;
       offsetInBuf = nextOffsetInBuf;
@@ -537,14 +1140,6 @@ function syncTranscriptState(rawTranscriptPath) {
       if (Array.isArray(e.tool_calls)) {
         state.pendingToolCalls = e.tool_calls;
         state.pendingStepIndex = stepIdx;
-        const callsAsk = e.tool_calls.some((tc) => tc && tc.name === "ask_question");
-        if (callsAsk) {
-          state.currentAskStepFound = true;
-          state.currentAskStepHasContent = visibleText.length > 0;
-          // 熔断线 2a：发起新的 ask_question 弹窗时，旧授权挂起等待新弹窗响应
-          state.approved = false;
-          state.approvedStepIndex = -1;
-        }
         for (const tc of e.tool_calls) {
           if (tc && WRITE_FILE_TOOLS.has(tc.name) && tc.args) {
             const tf = extractTargetFileFromArgs(tc.args).replace(/\\/g, "/").toLowerCase();
@@ -553,6 +1148,19 @@ function syncTranscriptState(rawTranscriptPath) {
             }
           }
         }
+        const callsAsk = e.tool_calls.some((tc) => tc && tc.name === "ask_question");
+        if (callsAsk) {
+          state.currentAskStepFound = true;
+          state.currentAskStepHasContent = visibleText.length > 0;
+          // 熔断线 2a：发起新的 ask_question 弹窗时，旧授权挂起等待新弹窗响应，并在后台提取本方案申请的权限范围
+          state.approved = false;
+          state.approvedStepIndex = -1;
+          const askTexts = collectAskQuestionTexts(e.tool_calls, visibleText);
+          const refsPlan = askTexts.some((t) => /implementation_plan\.md/i.test(t));
+          const planArtifactText = readCurrentConversationPlanArtifact(rawTranscriptPath, state.hasPlanSinceLastReset || refsPlan);
+          if (planArtifactText) askTexts.push(planArtifactText);
+          state.pendingGrants = mergeGrants(state.pendingGrants, extractScopeGrantsFromPlan(askTexts, workspaceRoots, homeDir));
+        }
       }
       lastValidOffset = readStart + nextOffsetInBuf;
       offsetInBuf = nextOffsetInBuf;
@@ -560,6 +1168,7 @@ function syncTranscriptState(rawTranscriptPath) {
     }
 
     if (e.type === "GENERIC") {
+      const hadPlan = state.hasPlanSinceLastReset;
       state.currentAskStepFound = false;
       state.currentAskStepHasContent = false;
       if (
@@ -585,6 +1194,8 @@ function syncTranscriptState(rawTranscriptPath) {
               const fe = JSON.parse(flines[j]);
               if (fe.step_index === state.pendingStepIndex && Array.isArray(fe.tool_calls)) {
                 presetOpts = extractAskQuestionPresetOptions(fe.tool_calls);
+                const fullAskTexts = collectAskQuestionTexts(fe.tool_calls, fe.content || "");
+                state.pendingGrants = mergeGrants(state.pendingGrants, extractScopeGrantsFromPlan(fullAskTexts, workspaceRoots, homeDir));
                 break;
               }
             } catch (e2) {}
@@ -600,11 +1211,17 @@ function syncTranscriptState(rawTranscriptPath) {
           state.approved = true;
           state.approvedStepIndex = stepIdx;
           state.lastResetReason = "";
+          const planArtifactText = readCurrentConversationPlanArtifact(rawTranscriptPath, hadPlan);
+          const fallbackGrants = extractScopeGrantsFromPlan([planArtifactText], workspaceRoots, homeDir);
+          state.approvedGrants = mergeGrants(state.approvedGrants, mergeGrants(state.pendingGrants, fallbackGrants));
+          state.pendingGrants = createEmptyGrants();
         } else {
-          // 熔断线 2b：Write-In 提示词补充、点击暂不修改或跳过 -> 立即撤权归零
+          // 熔断线 2b：Write-In 提示词补充、点击暂不修改或跳过 -> 立即撤权归零并清空待生效申请
           state.approved = false;
           state.approvedStepIndex = -1;
           state.lastResetReason = askEval.isWriteIn ? "write_in" : "ask_rejected";
+          state.pendingGrants = createEmptyGrants();
+          state.approvedGrants = createEmptyGrants();
         }
         state.pendingToolCalls = [];
         state.pendingStepIndex = -1;
@@ -616,22 +1233,26 @@ function syncTranscriptState(rawTranscriptPath) {
   }
 
   state.lastScannedOffset = lastValidOffset;
+  resolveAndLockWorkspaceRoots(payload, state, null, rawTranscriptPath);
+  backfillLegacyApprovedGrantsIfNeeded(state, null, rawTranscriptPath, state.lockedWorkspaceRoots, homeDir);
   saveState(statePath, state);
   return { exists: true, statePath, state };
 }
 
 function handlePreToolUse(payload) {
   try {
+    const homeDir = resolveHostHomeDir();
     const userLang = detectUserLang(payload.transcriptPath);
     const toolCall = payload.toolCall || {};
     const toolName = toolCall.name || "";
     const args = toolCall.args || {};
 
-    // 每次 PreToolUse 先执行增量字节同步（0 新增字节时 O(1) 瞬时返回，有新增行时确保即使先调只读工具也能立即捕获新 USER_INPUT 撤权）
-    const synced = syncTranscriptState(payload.transcriptPath);
+    // 每次 PreToolUse 先执行增量字节同步与会话级工作区固化（0 新增字节时 O(1) 瞬时返回）
+    const synced = syncTranscriptState(payload.transcriptPath, payload);
     const state = synced.state;
+    const workspaceRoots = resolveAndLockWorkspaceRoots(payload, state, synced.statePath, payload.transcriptPath);
 
-    // 阶段 1 & 2：模型无关纯只读工具、后台状态查询与只读子智能体直接放行（ask_question 需通过阶段 5 审计后再放行）
+    // 阶段 1 & 2：全盘只读放行（模型无关纯只读工具、后台状态查询与只读子智能体不限工作区内外直接放行；ask_question 需通过阶段 5 审计后再放行）
     if (toolName !== "ask_question" && isModelAgnosticReadOnlyTool(toolName, args)) {
       return reply({ decision: "allow" });
     }
@@ -649,7 +1270,7 @@ function handlePreToolUse(payload) {
       }
     }
 
-    // 阶段 4：终端命令只读审计（兼容 run_command 与 Bash）
+    // 阶段 4：终端命令只读审计（兼容 run_command 与 Bash，全盘只读命令免弹窗放行）
     if (EXEC_CMD_TOOLS.has(toolName)) {
       const cmd = String(args.CommandLine || args.command || "").trim();
       if (isPureReadOnlyCommand(cmd)) {
@@ -680,10 +1301,22 @@ function handlePreToolUse(payload) {
             : "[Subagent Direct Execution] This conversation is a subagent delegated by the Parent Agent, which has already obtained user button confirmation! Subagents are STRICTLY FORBIDDEN from calling ask_question to block execution. Directly execute file operations and terminal commands concurrently per the plan."
         });
       }
+      // 子智能体同样受父会话已获批的工作区与外部路径边界约束
+      const subScopeCheck = verifyToolCallAgainstApprovedGrants(
+        toolName,
+        args,
+        workspaceRoots,
+        state.approvedGrants,
+        homeDir,
+        userLang
+      );
+      if (!subScopeCheck.allowed) {
+        return reply({ decision: "deny", reason: subScopeCheck.reason });
+      }
       return reply({ decision: "allow" });
     }
 
-    // 针对主智能体 ask_question 本身的「必先输出聊天正文解释」「防折叠藏匿」与「分级展示」审计
+    // 针对主智能体 ask_question 本身的「必先输出聊天正文解释」「防折叠藏匿」「分级展示」与「后台自动提取申请权限」
     if (toolName === "ask_question") {
       if ((state.currentAskStepFound && !state.currentAskStepHasContent) || (!state.currentAskStepFound && !state.hasAssistantContentSinceLastReset)) {
         return reply({
@@ -694,16 +1327,18 @@ function handlePreToolUse(payload) {
         });
       }
       const qs = parseToolArg(args.questions);
+      const askPlanTexts = [];
       if (Array.isArray(qs)) {
         const lazyRefRegex = /(详见正文|见正文|如上所述|见上方|详见上方|同正文|方案见正文|详见方案|见方案|见上文|参考正文|参考上文|详见\s*implementation_plan|see above|see chat|as described above|refer to above|see details above|same as above)/i;
         for (const q of qs) {
           const qText = String((q && q.question) || "");
+          if (qText) askPlanTexts.push(qText);
           if (lazyRefRegex.test(qText)) {
             return reply({
               decision: "deny",
               reason: userLang === "zh"
-                ? "【方案门禁拦截 · 严禁折叠藏匿与冗余指代】严禁在 question 中写「详见正文/详见方案/详见 implementation_plan.md」等占位词！请在同一回合先输出聊天正文（content）解释，并将【纯修改方案（待修改的 [文件名](file:///...) 芯片及具体改动点）】直接写在 ask_question 的 question 窗口中，options 选项只放极简动作按钮（如「(Recommended) 确认执行」「采用方案 A」「暂不修改」，严禁在 options 中重复抄写方案），然后重新调用 ask_question。"
-                : "[Plan Guard Intercept | Lazy References Forbidden] Using placeholders like 'see above / refer to plan / see implementation_plan.md' in question is forbidden! Output analysis in chat body (content) first, and put the pure modification plan (target [filename](file:///...) chips and specific changes) directly in the ask_question modal. Keep options strictly to concise action buttons (e.g., '(Recommended) Confirm & Execute', 'Cancel'; never duplicate plan text in options), then call ask_question again."
+                ? "【方案门禁拦截 · 严禁折叠藏匿与冗余指代】严禁在 question 中写「详见正文/详见方案/详见 implementation_plan.md」等占位词！请在同一回合先输出聊天正文（content）解释，并将【纯修改方案（说明改哪些内容，以及改哪些工作区外的项目/目录）】直接写在 ask_question 的 question 窗口中，options 选项只放极简动作按钮（如「(Recommended) 确认执行」「采用方案 A」「暂不修改」，严禁在 options 中重复抄写方案），然后重新调用 ask_question。"
+                : "[Plan Guard Intercept | Lazy References Forbidden] Using placeholders like 'see above / refer to plan / see implementation_plan.md' in question is forbidden! Output analysis in chat body (content) first, and put the pure modification plan (what will be modified and which out-of-workspace directories/projects are involved) directly in the ask_question modal. Keep options strictly to concise action buttons (e.g., '(Recommended) Confirm & Execute', 'Cancel'; never duplicate plan text in options), then call ask_question again."
             });
           }
           if (Array.isArray(q && q.options)) {
@@ -729,11 +1364,31 @@ function handlePreToolUse(payload) {
           }
         }
       }
+      // 审计通过：后台隐式申请修改工具权限 + 提取方案中声明的工作区外粗粒度路径权限并持久化到 pendingGrants
+      const refsPlan = askPlanTexts.some((t) => /implementation_plan\.md/i.test(t));
+      const planArtifactText = readCurrentConversationPlanArtifact(payload.transcriptPath, state.hasPlanSinceLastReset || refsPlan);
+      if (planArtifactText) askPlanTexts.push(planArtifactText);
+      state.pendingGrants = mergeGrants(state.pendingGrants, extractScopeGrantsFromPlan(askPlanTexts, workspaceRoots, homeDir));
+      saveState(synced.statePath, state);
       return reply({ decision: "allow" });
     }
 
-    // 分支 1：已通过 ask_question 预设选项点击或明确授权（增量字节游标确认本轮内无撤权事件）-> 直接放行
+    // 分支 1：已通过 ask_question 预设选项点击或明确授权 -> 按本轮获批的权限范围（工作区内 + 已申请工作区外目录前缀）精准放行，严控未申请的工作区外修改
     if (state.approved) {
+      const scopeCheck = verifyToolCallAgainstApprovedGrants(
+        toolName,
+        args,
+        workspaceRoots,
+        state.approvedGrants,
+        homeDir,
+        userLang
+      );
+      if (!scopeCheck.allowed) {
+        return reply({
+          decision: "deny",
+          reason: scopeCheck.reason
+        });
+      }
       return reply({ decision: "allow" });
     }
 
@@ -752,12 +1407,12 @@ function handlePreToolUse(payload) {
       return reply({
         decision: "deny",
         reason: userLang === "zh"
-          ? "【方案门禁拦截 · 等待按钮确认】已生成 implementation_plan.md 大卡片，但尚未通过 ask_question 征得用户按钮确认！请在同一回合先输出聊天正文解释（content），并同时调用 ask_question 弹出确认面板：在 question 窗口中直接列出核心修改方案与目标业务文件芯片（严禁塞入原理解释，严禁写「详见正文/详见 implementation_plan.md」），options 仅放极简动作按钮（如「(Recommended) 确认执行」「暂不修改」，严禁复读方案），等待用户勾选提交后再执行修改。"
-          : "[Plan Guard Intercept | Awaiting Button Confirmation] implementation_plan.md artifact generated, but user button confirmation via ask_question has not been obtained! In the same turn, output explanations in chat content first, and call ask_question to present the confirmation modal: list core modification plan and target business file chips in question directly (no rationale dumping, no 'see above'), keep options as concise action buttons (e.g., '(Recommended) Confirm & Execute', 'Cancel'), and wait for user submission before modifying."
+          ? "【方案门禁拦截 · 等待按钮确认】已生成 implementation_plan.md 大卡片，但尚未通过 ask_question 征得用户按钮确认！请在同一回合先输出聊天正文解释（content），并同时调用 ask_question 弹出确认面板：在 question 窗口中直接列出核心修改方案（说明改哪些东西、若涉及工作区外需说明改哪些工作区外目录/模块，后台会自动申请对应修改工具与路径权限），options 仅放极简动作按钮（如「(Recommended) 确认执行」「暂不修改」），等待用户勾选提交后再执行修改。"
+          : "[Plan Guard Intercept | Awaiting Button Confirmation] implementation_plan.md artifact generated, but user button confirmation via ask_question has not been obtained! In the same turn, output explanations in chat content first, and call ask_question to present the confirmation modal: list core modification plan and any out-of-workspace directories/modules in question directly (background will automatically request tool and path permissions), keep options as concise action buttons (e.g., '(Recommended) Confirm & Execute', 'Cancel'), and wait for user submission before modifying."
       });
     }
 
-    // 分支 4：尚未调用 ask_question 确认 -> 阻断并引导模型按分级策略调用 ask_question
+    // 分支 4：尚未调用 ask_question 确认 -> 阻断并引导模型按分级策略调用 ask_question 申请权限
     let actionDesc = "状态修改或代码写盘操作";
     let actionDescEn = "state mutation or file writing";
     if (toolName === "run_command" || toolName === "Bash") {
@@ -774,9 +1429,9 @@ function handlePreToolUse(payload) {
       actionDescEn = "background task management with control side effects";
     }
 
-    const zhReason = "【方案门禁拦截 · 零信任白名单】检测到尚未通过按钮确认即尝试执行" + actionDesc + "（工具：" + toolName + "）。请按任务复杂度分级触发 ask_question 按钮确认（严禁无正文裸调弹窗，严禁让用户手动打字回复「确认」，严禁不写方案只写「详见正文/详见方案」）：1) 同回合先正文解释再弹窗：调用 ask_question 的同一回合必须先在聊天正文（content）输出完整的原因分析与原理解释，ask_question 的 question 窗口直接列出【纯修改方案（待修改的 [文件名](file:///...) 芯片及具体改动点）】；2) 简单任务（≤3文件）免写 implementation_plan.md（不弹大卡片），复杂任务（>3文件或多方案架构）先写 implementation_plan.md（可在 question 标题旁附带 [implementation_plan.md](file:///...) 芯片供弹窗期点击预览，且回合结束后底部自动挂载 Implementation Plan 大卡片）；3) 选项零复读：options 仅放极简动作按钮（单方案用「(Recommended) 确认执行 / 暂不修改」，多方案用「(Recommended) 采用方案 A / 采用方案 B / 暂不修改」），严禁在 options 中重复抄写方案内容！";
+    const zhReason = "【方案门禁拦截 · 按单申请与工作区内外把控】检测到尚未通过按钮确认即尝试执行" + actionDesc + "（工具：" + toolName + "）。当前门禁允许你在出方案前全盘调用任意只读工具免弹窗调研；在执行任何修改前，请按分级策略触发 ask_question 按钮确认：1) 同回合先正文解释再弹窗：调用 ask_question 的同一回合必须先在聊天正文（content）输出完整的原因分析与原理解释，ask_question 的 question 窗口直接列出【纯修改方案】（说明改哪些东西，无需写明具体修改工具名；若需修改当前工作区外的内容，请在方案中说明改哪些工作区外的项目或目录，无需写详细具体子文件路径，后台会自动提取并申请修改工具与外部路径权限）；2) 简单任务（≤3文件）免写 implementation_plan.md，复杂任务（>3文件或多方案架构）先写 implementation_plan.md 并在 question 标题旁附带 [implementation_plan.md](file:///...) 芯片；3) 选项零复读：options 仅放极简动作按钮（单方案用「(Recommended) 确认执行 / 暂不修改」，多方案用「(Recommended) 采用方案 A / 采用方案 B / 暂不修改」），用户确认后将自动放行已申请的工作区内及工作区外修改，未申请的工作区外路径仍将被严格拦截！";
 
-    const enReason = "[Plan Guard Intercept | Zero-Trust Whitelist] Attempted " + actionDescEn + " (tool: " + toolName + ") before user button confirmation! Trigger ask_question button confirmation graded by complexity (no empty-content popups, no asking user to type 'confirm' manually, no lazy 'see above' references): 1) Chat explanation before popup in same turn: output full analysis and rationale in chat content first, list pure modification plan and target [filename](file:///...) chips directly in ask_question modal; 2) Skip implementation_plan.md for simple tasks (<=3 files); generate implementation_plan.md for complex tasks (>3 files) and attach [implementation_plan.md](file:///...) chip in question; 3) Zero-duplication options: keep options strictly to concise action buttons (single option: [\"(Recommended) Confirm & Execute\", \"Cancel\"]; multiple options: [\"(Recommended) Option A\", \"Option B\", \"Cancel\"]); never copy plan text into options!";
+    const enReason = "[Plan Guard Intercept | Scoped Permission Application] Attempted " + actionDescEn + " (tool: " + toolName + ") before user button confirmation! Full-disk read-only tools are allowed without popups during research; before making any changes, trigger ask_question button confirmation: 1) Chat explanation before popup in same turn: output full analysis and rationale in chat content first, list pure modification plan directly in ask_question modal (explain what will be modified without needing specific tool names; if modifying files outside the current workspace, state which external project/directory will be modified without needing detailed leaf file paths—background automatically requests tool and path permissions); 2) Skip implementation_plan.md for simple tasks (<=3 files); generate implementation_plan.md for complex tasks (>3 files); 3) Concise action buttons only in options ([\"(Recommended) Confirm & Execute\", \"Cancel\"]). Once approved, declared workspace and external path modifications will be allowed while undeclared external paths remain strictly blocked!";
 
     return reply({
       decision: "deny",
@@ -830,24 +1485,30 @@ function handlePostToolUse(payload) {
     }
     // 执行增量同步（仅实际解析新增 JSONL 行，绝不盲目覆盖 lastScannedOffset）
     if (payload && payload.transcriptPath) {
-      syncTranscriptState(payload.transcriptPath);
+      syncTranscriptState(payload.transcriptPath, payload);
     }
   } catch (e) {}
   return reply({});
 }
 
 function handlePreInvocation(payload) {
+  let wsSummary = "";
   try {
     if (payload && payload.transcriptPath) {
-      const synced = syncTranscriptState(payload.transcriptPath);
+      const synced = syncTranscriptState(payload.transcriptPath, payload);
+      if (synced.exists && Array.isArray(synced.state.lockedWorkspaceRoots) && synced.state.lockedWorkspaceRoots.length > 0) {
+        wsSummary = synced.state.lockedWorkspaceRoots.join(", ");
+      }
       if (synced.exists && synced.state.approved) {
         return reply({});
       }
     }
   } catch (e) {}
   const userLang = detectUserLang(payload && payload.transcriptPath);
-  const zhMessage = "【方案门禁在线（主智能体单点确认 · 子智能体免弹窗直通）】1) 若当前会话是由主智能体通过 invoke_subagent 委派的子智能体（Subagent，即收到 <SYSTEM_MESSAGE> [Message] ... sender=... 指令），主智能体在派单前已完成用户确认，子智能体【严禁调用 ask_question 弹窗阻塞】，必须直接按施工图并发执行文件读写与终端验证！2) 若当前会话为直接面向用户的【主智能体（Main Agent）】，执行任何代码/文档修改或派发写盘子智能体前，必须通过 ask_question 弹出按钮卡片暂停确认，并遵守三项 UI 铁律：a) 同回合先正文解释再弹窗（调用 ask_question 的同一回合必须在聊天正文 content 中先输出完整的原因分析与解释说明，严禁无正文裸调弹窗；question 窗口直接列出【纯修改方案】与目标业务文件 [文件名](file:///...) 芯片；简单任务免写 implementation_plan.md 不弹大卡片，复杂任务先写 implementation_plan.md 并在 question 标题旁附 [implementation_plan.md](file:///...) 芯片供弹窗期预览，回合结束时底部自动挂载 Implementation Plan 大卡片，严禁不写方案只写「详见正文/方案」）；b) 选项只做极简按钮（单方案：[\"(Recommended) 确认执行\", \"暂不修改\"]；多方案：[\"(Recommended) 采用方案 A\", \"采用方案 B\", \"暂不修改\"]，严禁在 options 中重复抄写方案）；c) Write-In 自定义输入视为提示词补充，须在聊天正文回应并调整方案后再次调用 ask_question 确认！";
-  const enMessage = "[Plan Guard Online (Main Agent Single-Point Confirmation | Subagents Bypass)] 1) If the current conversation is a subagent delegated by the main agent via invoke_subagent (received <SYSTEM_MESSAGE> [Message] ... sender=... instruction), the main agent has already obtained user confirmation. Subagents are STRICTLY FORBIDDEN from calling ask_question to block for user input; proceed directly with concurrent file operations and terminal verifications per the plan! 2) If the current conversation is the user-facing Main Agent, before executing any code/document mutations or dispatching mutating subagents, you MUST call ask_question to pause for button confirmation, adhering to three UI rules: a) Provide chat body explanation before popup in the same turn (always output full analysis and rationale in chat content first; never call ask_question with empty content. Place pure modification plan and target [filename](file:///...) chips directly in the question window. Skip implementation_plan.md for simple tasks <=3 files; write implementation_plan.md for complex tasks >3 files and include [implementation_plan.md](file:///...) chip in question. Never say 'see above/refer to plan'); b) Use concise action options only (single option: [\"(Recommended) Confirm & Execute\", \"Cancel\"]; multiple options: [\"(Recommended) Option A\", \"Option B\", \"Cancel\"]; never duplicate plan details in options); c) Treat custom write-in input as prompt refinement; address it in chat content and call ask_question again for approval!";
+  const wsHintZh = wsSummary ? "（当前会话已独立固化工作区：" + wsSummary + "，前后台切换项目互不串扰）" : "";
+  const wsHintEn = wsSummary ? " (Conversation-locked workspace: " + wsSummary + ", immune to foreground project switching)" : "";
+  const zhMessage = "【方案门禁在线（全盘只读免弹窗 · 按单申请修改与跨区权限 · 子智能体免弹窗直通）】" + wsHintZh + " 1) 出方案前允许全盘调用任意只读工具（read_file/list_dir/grep_search/只读终端命令/research 子智能体）免弹窗勘测；2) 若当前会话是由主智能体委派的子智能体（Subagent，含 sender=<UUID>），严禁调用 ask_question 弹窗阻塞，直接在主智能体已获批的工作区与外部路径范围内并发执行！3) 若当前会话为主智能体（Main Agent），执行任何修改前必须同回合先输出聊天正文解释（content）再调用 ask_question 列出【纯修改方案】：方案中说明要改哪些内容（无需写明具体修改工具名，后台自动申请修改工具权限）；若涉及修改当前工作区外的内容，必须在方案中说明要改哪些工作区外的项目或目录（无需写详细具体子文件路径，后台自动提取并申请该外部目录权限）；options 仅放极简按钮（如 [\"(Recommended) 确认执行\", \"暂不修改\"]）。用户同意后自动放行已申请范围，未申请的工作区外修改将被严格拦截！";
+  const enMessage = "[Plan Guard Online (Full-Disk Read Free | Scoped Mutation & External Path Grants | Subagents Bypass)]" + wsHintEn + " 1) Full-disk read-only tools (read_file/list_dir/grep_search/read-only commands/research subagent) are allowed without popups before proposing a plan; 2) If this conversation is a Subagent (woken by sender=<UUID>), NEVER call ask_question; execute directly within the parent's approved workspace and external path scope! 3) If this is the Main Agent, before any modification, output full explanation in chat content first and call ask_question in the same turn to list the pure modification plan: explain what will be modified (no need to list specific tool names; background automatically requests mutation tool permissions); if modifying anything outside the current workspace, state which external project/directory will be modified (coarse directory/project path is sufficient without detailed leaf paths; background automatically requests external path permissions); keep options to concise buttons ([\"(Recommended) Confirm & Execute\", \"Cancel\"]). Approved scopes are allowed while undeclared external paths remain strictly blocked!";
   return reply({
     injectSteps: [{
       ephemeralMessage: userLang === "zh" ? zhMessage : enMessage
@@ -858,12 +1519,14 @@ function handlePreInvocation(payload) {
 function handleStop(payload) {
   try {
     if (payload && payload.transcriptPath) {
-      const synced = syncTranscriptState(payload.transcriptPath);
+      const synced = syncTranscriptState(payload.transcriptPath, payload);
       const reason = String(payload.terminationReason || "");
-      // 官方 Stop 契约：当用户取消（USER_CANCELED）或当前回合完全结束且无后台任务（NO_TOOL_CALL && fullyIdle）时，自动归零本轮授权
+      // 官方 Stop 契约：当用户取消（USER_CANCELED）或当前回合完全结束且无后台任务（NO_TOOL_CALL && fullyIdle）时，自动归零本轮授权与已申请范围（保留会话固化的 lockedWorkspaceRoots）
       if (reason === "USER_CANCELED" || (reason === "NO_TOOL_CALL" && payload.fullyIdle === true)) {
         synced.state.approved = false;
         synced.state.approvedStepIndex = -1;
+        synced.state.pendingGrants = createEmptyGrants();
+        synced.state.approvedGrants = createEmptyGrants();
         saveState(synced.statePath, synced.state);
       }
     }
@@ -871,27 +1534,8 @@ function handleStop(payload) {
   return reply({ decision: "allow" });
 }
 
-function resolveHostHomeDir() {
-  const normalized = __dirname.replace(/\\/g, "/");
-  const geminiIdx = normalized.toLowerCase().indexOf("/.gemini/");
-  if (geminiIdx > 0) {
-    const candidate = path.normalize(__dirname.slice(0, geminiIdx));
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  const os = require("os");
-  return os.homedir();
-}
-
-function normalizePathForMatch(str) {
-  if (!str || typeof str !== "string") return "";
-  let p = str.trim().replace(/^file:\/\/\//i, "").replace(/^file:\/\//i, "");
-  try { p = decodeURIComponent(p); } catch (_) {}
-  p = p.replace(/\\/g, "/").replace(/^([a-zA-Z])%3A/i, "$1:").replace(/^\/([a-zA-Z]:)/, "$1");
-  while (p.endsWith("/")) p = p.slice(0, -1);
-  return p.toLowerCase();
-}
-
 function isPlanGuardEnabledForPayload(payload) {
+  if (process.env.PLAN_GUARD_FORCE_ENABLED === "1") return true;
   try {
     const homeDir = resolveHostHomeDir();
     const profilesPath = path.join(homeDir, ".gemini", "config", "project-plugin-profiles.json");
@@ -927,13 +1571,11 @@ function isPlanGuardEnabledForPayload(payload) {
       } catch (_) {}
     }
 
-    // 2. 次选从 profiles.__meta__.convProjectMap 或当前活跃 Sidecar 会话映射读取
+    // 2. 次选从 profiles.__meta__.convProjectMap 按 convId 精确查表（严禁读取前台焦点状态）
     if (!projectId && convId && profiles && profiles.__meta__) {
       const mapped = profiles.__meta__.convProjectMap && profiles.__meta__.convProjectMap[convId];
       if (mapped && profiles[mapped]) {
         projectId = mapped;
-      } else if (profiles.__meta__.lastSidecarConvId === convId && profiles.__meta__.lastSidecarProjectId) {
-        projectId = profiles.__meta__.lastSidecarProjectId;
       }
     }
 
@@ -971,7 +1613,12 @@ function isPlanGuardEnabledForPayload(payload) {
       return Boolean(profiles[projectId].plugins["plan-guard"]);
     }
 
-    // 5. 兜底核对全局 config.json
+    // 5. 若未命中已登记项目，优先回退到 profiles.__default__（默认配置），防止被其他关闭了 plan-guard 的项目动态刷写的 config.json 瞬态污染
+    if (profiles && profiles.__default__ && profiles.__default__.plugins && profiles.__default__.plugins["plan-guard"] !== undefined) {
+      return Boolean(profiles.__default__.plugins["plan-guard"]);
+    }
+
+    // 6. 最终兜底核对全局 config.json
     if (fs.existsSync(configPath)) {
       const cfg = JSON.parse(fs.readFileSync(configPath, "utf8"));
       if (cfg && cfg.plugins && cfg.plugins["plan-guard"] && cfg.plugins["plan-guard"].enabled !== undefined) {
