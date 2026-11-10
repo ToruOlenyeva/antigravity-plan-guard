@@ -265,9 +265,9 @@ function handlePreToolUse(payload) {
       actionDescEn = "background task management with control side effects";
     }
 
-    const zhReason = "【方案门禁拦截 · 按单申请与工作区内外把控】检测到尚未通过按钮确认即尝试执行" + actionDesc + "（工具：" + toolName + "）。当前门禁允许你在出方案前全盘调用任意只读工具免弹窗调研；在执行任何修改前，请按分级策略触发 ask_question 按钮确认：1) 同回合先正文解释再弹窗：调用 ask_question 的同一回合必须先在聊天正文（content）输出完整的原因分析与原理解释，ask_question 的 question 窗口直接列出【纯修改方案】（说明改哪些东西，无需写明具体修改工具名；若需修改当前工作区外的内容，请在方案中写明要改哪些工作区外的项目名或插件名，严禁在弹窗中裸写 C:/Users/... 等详细绝对路径，且 brain/<id>/scratch 临时目录免申报，后台会自动从项目名/插件名/正文芯片提取并申请外部路径权限）；2) 简单任务（≤3文件）免写 implementation_plan.md，复杂任务（>3文件或多方案架构）先写 implementation_plan.md 并在 question 标题旁附带 [implementation_plan.md](file:///...) 芯片；3) 选项零复读：options 仅放极简动作按钮（单方案用「(Recommended) 确认执行 / 暂不修改」，多方案用「(Recommended) 采用方案 A / 采用方案 B / 暂不修改」），用户确认后将自动放行已申请的工作区内及工作区外修改，未申请的工作区外路径仍将被严格拦截！";
+    const zhReason = "【方案门禁拦截 · 按单申请与工作区内外把控】检测到尚未通过按钮确认即尝试执行" + actionDesc + "（工具：" + toolName + "）。出方案前允许全盘调用只读工具免弹窗调研；执行任何修改前，必须同回合先在聊天正文（content）输出完整原因分析，再调用 ask_question 列出【纯修改方案】（若涉及工作区外修改只需写明外部项目名或插件名，严禁裸写 C:/Users/... 等详细路径，brain/<id>/scratch 免申报；复杂任务先写 implementation_plan.md）；options 仅放极简按钮（如 [\"(Recommended) 确认执行\", \"暂不修改\"]）。";
 
-    const enReason = "[Plan Guard Intercept | Scoped Permission Application] Attempted " + actionDescEn + " (tool: " + toolName + ") before user button confirmation! Full-disk read-only tools are allowed without popups during research; before making any changes, trigger ask_question button confirmation: 1) Chat explanation before popup in same turn: output full analysis and rationale in chat content first, list pure modification plan directly in ask_question modal (explain what will be modified without needing specific tool names; if modifying files outside the current workspace, state which external project or plugin name will be modified—NEVER write raw full filesystem paths like C:/Users/... in the modal, and brain/<id>/scratch temp files require no declaration; background automatically resolves project/plugin names and chips); 2) Skip implementation_plan.md for simple tasks (<=3 files); generate implementation_plan.md for complex tasks (>3 files); 3) Concise action buttons only in options ([\"(Recommended) Confirm & Execute\", \"Cancel\"]). Once approved, declared workspace and external path modifications will be allowed while undeclared external paths remain strictly blocked!";
+    const enReason = "[Plan Guard Intercept | Scoped Permission Application] Attempted " + actionDescEn + " (tool: " + toolName + ") before user button confirmation! Full-disk read-only tools are allowed during research; before any modification, output full analysis in chat content first and call ask_question in the same turn with the pure modification plan (state external project/plugin names without raw full paths; brain/<id>/scratch is exempt); keep options to concise buttons ([\"(Recommended) Confirm & Execute\", \"Cancel\"]).";
 
     return reply({
       decision: "deny",
@@ -327,11 +327,46 @@ async function handleStop(payload) {
       const synced = syncTranscriptState(payload.transcriptPath, payload);
       const reason = String(payload.terminationReason || "");
       if (reason === "USER_CANCELED" || (reason === "NO_TOOL_CALL" && payload.fullyIdle === true)) {
+        const isSubagent = !synced.state.hasUserInput && synced.state.hasParentSenderMessage;
+        if (reason === "NO_TOOL_CALL" && payload.fullyIdle === true && !isSubagent) {
+          const wakeupCount = Number(synced.state.outerReplyWakeupCount) || 0;
+          const toolCallsInTurn = Number(synced.state.turnToolCallCount) || 0;
+          const lastHasTools = Boolean(synced.state.lastPlannerStepHasToolCalls);
+          const finalLen = Number(synced.state.lastPlannerStepContentLen) || 0;
+          const foldedLen = Number(synced.state.foldedToolStepSubstantiveLen) || 0;
+          const hasFoldedMarkers = Boolean(synced.state.foldedToolStepHasFinalReportMarkers);
+
+          const emptyFinalReplyAfterTools = toolCallsInTurn > 0 && (lastHasTools || finalLen === 0);
+          const reportSwallowedInToolStep =
+            (hasFoldedMarkers || foldedLen >= 240) &&
+            finalLen < Math.min(120, Math.floor(foldedLen * 0.5));
+
+          if (wakeupCount < 1 && (emptyFinalReplyAfterTools || reportSwallowedInToolStep)) {
+            synced.state.outerReplyWakeupCount = wakeupCount + 1;
+            synced.state.foldedToolStepSubstantiveLen = 0;
+            synced.state.foldedToolStepHasFinalReportMarkers = false;
+            saveState(synced.statePath, synced.state);
+            const userLang = detectUserLang(payload.transcriptPath);
+            return reply({
+              decision: "continue",
+              reason: userLang === "zh"
+                ? "【折叠外回复守卫（Stop Hook 强控）】检测到你在本轮中将正式回复/结案汇报与工具调用混发在同一回合（导致回复正文被宿主折叠进 Worked for ... > 内部），或回合结束步未输出任何正文（折叠块外无气泡）！请立即在不调用任何工具的纯文本回合中，将面向用户的完整正式回复重新输出一遍，确保回复气泡 100% 呈现在 Worked for ... > 折叠块外部。"
+                : "[Outer Reply Guard (Stop Hook)] Detected that your formal response/final report was mixed with tool calls in the same step (causing it to be collapsed inside 'Worked for ... >'), or the final step had empty content! Please immediately output the complete user-facing response in a pure-text turn WITHOUT calling any tools, ensuring the reply bubble renders outside the collapsed block."
+            });
+          }
+        }
+
         synced.state.approved = false;
         synced.state.approvedStepIndex = -1;
         synced.state.pendingGrants = createEmptyGrants();
         synced.state.approvedGrants = createEmptyGrants();
         synced.state.activeBgTasks = {};
+        synced.state.turnToolCallCount = 0;
+        synced.state.lastPlannerStepHasToolCalls = false;
+        synced.state.lastPlannerStepContentLen = 0;
+        synced.state.foldedToolStepSubstantiveLen = 0;
+        synced.state.foldedToolStepHasFinalReportMarkers = false;
+        synced.state.outerReplyWakeupCount = 0;
         saveState(synced.statePath, synced.state);
         return reply({ decision: "allow" });
       }
