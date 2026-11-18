@@ -5,8 +5,32 @@ const auditMod = require("./lib/read-only-audit.cjs");
 const grantsMod = require("./lib/workspace-grants.cjs");
 const stateMod = require("./lib/transcript-state.cjs");
 const { WRITE_FILE_TOOLS, EXEC_CMD_TOOLS, parseToolArg, isModelAgnosticReadOnlyTool, extractTargetFileFromArgs, isPureReadOnlyCommand, isWhitelistedTarget, isReadOnlySubagentCall, findRawDetailedPathInAskQuestion } = auditMod;
-const { resolveHostHomeDir, normalizePathForMatch, createEmptyGrants, mergeGrants, extractConvId, extractScopeGrantsFromPlan, readCurrentConversationPlanArtifact, verifyToolCallAgainstApprovedGrants } = grantsMod;
+const { resolveHostHomeDir, normalizePathForMatch, isPathInsidePrefixes, createEmptyGrants, mergeGrants, extractConvId, extractScopeGrantsFromPlan, hasPlanOrAccessProposalInText, extractCommandTargetPaths, readCurrentConversationPlanArtifact, verifyToolCallAgainstApprovedGrants } = grantsMod;
 const { saveState, resolveAndLockWorkspaceRoots, syncTranscriptState, stripArtifactFeedbackFileSync, stripArtifactFeedbackButton, readTaskLogSnapshot, isFastCompletionOrPromptTail } = stateMod;
+
+function hasExternalReadPathInArgs(toolName, args, workspaceRoots, homeDir) {
+  const roots = Array.isArray(workspaceRoots) ? workspaceRoots : [];
+  if (roots.length === 0 || !args || typeof args !== "object") return false;
+  const rawPaths = [
+    extractTargetFileFromArgs(args),
+    parseToolArg(args.DirectoryPath),
+    parseToolArg(args.SearchDirectory),
+    parseToolArg(args.SearchPath),
+    parseToolArg(args.File)
+  ];
+  if (EXEC_CMD_TOOLS.has(toolName)) {
+    const cmd = String(args.CommandLine || args.command || "").trim();
+    if (cmd) rawPaths.push(...extractCommandTargetPaths(cmd, homeDir));
+  }
+  for (const rp of rawPaths) {
+    if (!rp || typeof rp !== "string") continue;
+    const norm = normalizePathForMatch(rp);
+    if (!norm || !/^[a-z]:\//i.test(norm)) continue;
+    if (isWhitelistedTarget(norm)) continue;
+    if (!isPathInsidePrefixes(norm, roots)) return true;
+  }
+  return false;
+}
 
 function detectUserLang(transcriptPath) {
   if (transcriptPath) {
@@ -67,25 +91,40 @@ function handlePreToolUse(payload) {
     const state = synced.state;
     const workspaceRoots = resolveAndLockWorkspaceRoots(payload, state, synced.statePath, payload.transcriptPath);
 
-    // 阶段 1 & 2：全盘只读放行（纯只读工具、后台状态查询与只读子智能体不限工作区内外直接放行；ask_question 需通过阶段 5 审计后再放行）
+    // 阶段 1 & 2：全盘只读放行（纯只读工具、后台状态查询与只读只智能体不限工作区内外直接放行；ask_question 需通过阶段 5 审计后再放行）
+    const isSubagent = !state.hasUserInput && state.hasParentSenderMessage;
+    const markReadRequestIfNeeded = () => {
+      if (state.approved || isSubagent || state.requestedAccessInTurn) return;
+      if (hasExternalReadPathInArgs(toolName, args, workspaceRoots, homeDir) || Number(state.turnToolCallCount || 0) > 0) {
+        state.requestedAccessInTurn = true;
+        saveState(synced.statePath, state);
+      }
+    };
     if (toolName !== "ask_question" && isModelAgnosticReadOnlyTool(toolName, args)) {
+      let dirtyState = false;
       if (toolName === "manage_task" && args && typeof args === "object") {
         const act = String(args.Action || args.action || "").toLowerCase();
         const tid = String(args.TaskId || args.taskId || args.task_id || "").trim();
         if (act === "kill" && tid && state.activeBgTasks) {
-          let removed = false;
           for (const k of Object.keys(state.activeBgTasks)) {
             if (k === tid || k.endsWith("/" + tid) || tid.endsWith("/" + k)) {
               delete state.activeBgTasks[k];
-              removed = true;
+              dirtyState = true;
             }
           }
-          if (removed) saveState(synced.statePath, state);
         }
       }
+      if (!state.approved && !isSubagent && !state.requestedAccessInTurn) {
+        if (hasExternalReadPathInArgs(toolName, args, workspaceRoots, homeDir) || Number(state.turnToolCallCount || 0) > 0) {
+          state.requestedAccessInTurn = true;
+          dirtyState = true;
+        }
+      }
+      if (dirtyState) saveState(synced.statePath, state);
       return reply({ decision: "allow" });
     }
     if ((toolName === "invoke_subagent" || toolName === "Task") && isReadOnlySubagentCall(args)) {
+      markReadRequestIfNeeded();
       return reply({ decision: "allow" });
     }
 
@@ -103,6 +142,7 @@ function handlePreToolUse(payload) {
     if (EXEC_CMD_TOOLS.has(toolName)) {
       const cmd = String(args.CommandLine || args.command || "").trim();
       if (isPureReadOnlyCommand(cmd)) {
+        markReadRequestIfNeeded();
         return reply({ decision: "allow" });
       }
     }
@@ -120,7 +160,6 @@ function handlePreToolUse(payload) {
     }
 
     // 子智能体会话识别：无人类直接输入（USER_EXPLICIT）且由父智能体 SYSTEM_MESSAGE (sender=<UUID>) 唤醒
-    const isSubagent = !state.hasUserInput && state.hasParentSenderMessage;
     if (isSubagent) {
       if (toolName === "ask_question") {
         return reply({
@@ -208,8 +247,22 @@ function handlePreToolUse(payload) {
       const planArtifactText = readCurrentConversationPlanArtifact(payload.transcriptPath, state.hasPlanSinceLastReset || refsPlan);
       if (planArtifactText) askPlanTexts.push(planArtifactText);
       state.pendingGrants = mergeGrants(state.pendingGrants, extractScopeGrantsFromPlan(askPlanTexts, workspaceRoots, homeDir));
+      state.hasAskInTurn = true;
+      state.missingAskWakeupCount = 0;
       saveState(synced.statePath, state);
       return reply({ decision: "allow" });
+    }
+
+    if (toolName === "exit_plan_mode" && !state.approved) {
+      state.deniedGateInTurn = true;
+      state.requestedAccessInTurn = true;
+      saveState(synced.statePath, state);
+      return reply({
+        decision: "deny",
+        reason: userLang === "zh"
+          ? "【方案门禁拦截】你尚未通过 ask_question 弹窗获得用户点击确认，严禁直接调用 exit_plan_mode 进入执行阶段！请先在同一回合输出修改方案正文并调用 ask_question 弹出确认窗口。"
+          : "[Plan Guard Intercept] You have not obtained user click confirmation via ask_question yet! Calling exit_plan_mode directly is forbidden. Output your modification plan in chat content and call ask_question first."
+      });
     }
 
     // 分支 1：已通过 ask_question 预设选项点击或明确授权 -> 按本轮获批权限范围精准放行
@@ -230,6 +283,9 @@ function handlePreToolUse(payload) {
 
     // 分支 2：用户在 ask_question 中使用了自定义输入（Write-In 提示词补充）
     if (state.lastResetReason === "write_in") {
+      state.deniedGateInTurn = true;
+      state.requestedAccessInTurn = true;
+      saveState(synced.statePath, state);
       return reply({
         decision: "deny",
         reason: userLang === "zh"
@@ -240,6 +296,9 @@ function handlePreToolUse(payload) {
 
     // 分支 3：已生成 implementation_plan.md 但尚未调用 ask_question 取得用户按钮确认
     if (state.hasPlanSinceLastReset) {
+      state.deniedGateInTurn = true;
+      state.requestedAccessInTurn = true;
+      saveState(synced.statePath, state);
       return reply({
         decision: "deny",
         reason: userLang === "zh"
@@ -249,6 +308,9 @@ function handlePreToolUse(payload) {
     }
 
     // 分支 4：尚未调用 ask_question 确认 -> 阻断并引导模型按分级策略调用 ask_question 申请权限
+    state.deniedGateInTurn = true;
+    state.requestedAccessInTurn = true;
+    saveState(synced.statePath, state);
     let actionDesc = "状态修改或代码写盘操作";
     let actionDescEn = "state mutation or file writing";
     if (toolName === "run_command" || toolName === "Bash") {
@@ -354,6 +416,33 @@ async function handleStop(payload) {
                 : "[Outer Reply Guard (Stop Hook)] Detected that your formal response/final report was mixed with tool calls in the same step (causing it to be collapsed inside 'Worked for ... >'), or the final step had empty content! Please immediately output the complete user-facing response in a pure-text turn WITHOUT calling any tools, ensuring the reply bubble renders outside the collapsed block."
             });
           }
+
+          if (!synced.state.approved && !synced.state.hasAskInTurn && (Number(synced.state.missingAskWakeupCount) || 0) < 1) {
+            const lastText = String(synced.state.lastAssistantContent || "");
+            const hasProposal = Boolean(
+              synced.state.hasPlanSinceLastReset ||
+              synced.state.deniedGateInTurn ||
+              synced.state.hasPlanProposalInTurn ||
+              hasPlanOrAccessProposalInText(lastText, synced.state.lockedWorkspaceRoots, resolveHostHomeDir())
+            );
+            const hadPriorToolOrAccess = Boolean(
+              synced.state.requestedAccessInTurn ||
+              toolCallsInTurn > 0 ||
+              synced.state.deniedGateInTurn ||
+              synced.state.hasPlanSinceLastReset
+            );
+            if (hasProposal && hadPriorToolOrAccess) {
+              synced.state.missingAskWakeupCount = (Number(synced.state.missingAskWakeupCount) || 0) + 1;
+              saveState(synced.statePath, synced.state);
+              const userLang = detectUserLang(payload.transcriptPath);
+              return reply({
+                decision: "continue",
+                reason: userLang === "zh"
+                  ? "【方案门禁提醒 · 漏调 ask_question 确认弹窗】检测到你在本轮出方案前已申请工具调用或路径访问权限（或已输出修改方案/尝试调用受控工具），但本轮未调用 ask_question 弹出确认窗口！本门禁仅支持点击 ask_question 弹窗确认，请立即调用 ask_question（在 question 中列出修改方案与外部项目/插件名，严禁裸写详细路径，options 固定为 [\"(Recommended) 确认执行\", \"暂不修改\"]）供用户点击确认。"
+                  : "[Plan Guard Reminder | Missing ask_question Popup] Detected that you requested tool calls or path access permissions (or output a modification plan / attempted a gated tool) in this turn without calling ask_question! Confirmation is click-only via ask_question: please immediately call ask_question (list the modification plan and external project/plugin names without raw full paths, with options [\"(Recommended) Confirm & Execute\", \"Cancel\"])."
+              });
+            }
+          }
         }
 
         synced.state.approved = false;
@@ -367,6 +456,11 @@ async function handleStop(payload) {
         synced.state.foldedToolStepSubstantiveLen = 0;
         synced.state.foldedToolStepHasFinalReportMarkers = false;
         synced.state.outerReplyWakeupCount = 0;
+        synced.state.hasAskInTurn = false;
+        synced.state.requestedAccessInTurn = false;
+        synced.state.hasPlanProposalInTurn = false;
+        synced.state.deniedGateInTurn = false;
+        synced.state.missingAskWakeupCount = 0;
         saveState(synced.statePath, synced.state);
         return reply({ decision: "allow" });
       }
