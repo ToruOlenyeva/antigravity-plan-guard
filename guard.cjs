@@ -4,7 +4,7 @@ const path = require("path");
 const auditMod = require("./lib/read-only-audit.cjs");
 const grantsMod = require("./lib/workspace-grants.cjs");
 const stateMod = require("./lib/transcript-state.cjs");
-const { WRITE_FILE_TOOLS, EXEC_CMD_TOOLS, parseToolArg, isModelAgnosticReadOnlyTool, extractTargetFileFromArgs, isPureReadOnlyCommand, isWhitelistedTarget, isReadOnlySubagentCall, findRawDetailedPathInAskQuestion } = auditMod;
+const { WRITE_FILE_TOOLS, EXEC_CMD_TOOLS, parseToolArg, isModelAgnosticReadOnlyTool, extractTargetFileFromArgs, isPureReadOnlyCommand, isWhitelistedTarget, isReadOnlySubagentCall, findRawDetailedPathInAskQuestion, isVoiceContextPayload, extractVoiceUserUtterances } = auditMod;
 const { resolveHostHomeDir, normalizePathForMatch, isPathInsidePrefixes, createEmptyGrants, mergeGrants, extractConvId, extractScopeGrantsFromPlan, hasPlanOrAccessProposalInText, extractCommandTargetPaths, readCurrentConversationPlanArtifact, verifyToolCallAgainstApprovedGrants } = grantsMod;
 const { saveState, resolveAndLockWorkspaceRoots, syncTranscriptState, stripArtifactFeedbackFileSync, stripArtifactFeedbackButton, readTaskLogSnapshot, isFastCompletionOrPromptTail } = stateMod;
 
@@ -52,7 +52,10 @@ function detectUserLang(transcriptPath) {
           try {
             const e = JSON.parse(lines[i]);
             if (e.source === "USER_EXPLICIT" || e.type === "USER_INPUT") {
-              const text = String(e.content || "");
+              const rawText = String(e.content || "");
+              const text = isVoiceContextPayload(rawText)
+                ? extractVoiceUserUtterances(rawText).join(" ")
+                : rawText.replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, "");
               if (/[\u4e00-\u9fff]/.test(text)) return "zh";
               if (/[a-zA-Z]/.test(text)) return "en";
             }
@@ -257,11 +260,15 @@ function handlePreToolUse(payload) {
       state.deniedGateInTurn = true;
       state.requestedAccessInTurn = true;
       saveState(synced.statePath, state);
+      const exitReasonZh = state.isVoiceMode
+        ? "【方案门禁拦截 · 语音模式】尚未获得用户明确授权！请先向用户汇报修改方案，等待用户口头明确说出「确认执行」（英文说 confirm and execute / confirm execute）或点击 ask_question 按钮后再调用 exit_plan_mode。"
+        : "【方案门禁拦截】你尚未通过 ask_question 弹窗获得用户点击确认，严禁直接调用 exit_plan_mode 进入执行阶段！请先在同一回合输出修改方案正文并调用 ask_question 弹出确认窗口。";
+      const exitReasonEn = state.isVoiceMode
+        ? "[Plan Guard Intercept | Voice Mode] User authorization has not been obtained yet! Present your modification plan first and wait for the user to say exact \"confirm and execute\" / \"confirm execute\" (Chinese: \"确认执行\") or click ask_question before calling exit_plan_mode."
+        : "[Plan Guard Intercept] You have not obtained user click confirmation via ask_question yet! Calling exit_plan_mode directly is forbidden. Output your modification plan in chat content and call ask_question first.";
       return reply({
         decision: "deny",
-        reason: userLang === "zh"
-          ? "【方案门禁拦截】你尚未通过 ask_question 弹窗获得用户点击确认，严禁直接调用 exit_plan_mode 进入执行阶段！请先在同一回合输出修改方案正文并调用 ask_question 弹出确认窗口。"
-          : "[Plan Guard Intercept] You have not obtained user click confirmation via ask_question yet! Calling exit_plan_mode directly is forbidden. Output your modification plan in chat content and call ask_question first."
+        reason: userLang === "zh" ? exitReasonZh : exitReasonEn
       });
     }
 
@@ -327,9 +334,13 @@ function handlePreToolUse(payload) {
       actionDescEn = "background task management with control side effects";
     }
 
-    const zhReason = "【方案门禁拦截 · 按单申请与工作区内外把控】检测到尚未通过按钮确认即尝试执行" + actionDesc + "（工具：" + toolName + "）。出方案前允许全盘调用只读工具免弹窗调研；执行任何修改前，必须同回合先在聊天正文（content）输出完整原因分析，再调用 ask_question 列出【纯修改方案】（若涉及工作区外修改只需写明外部项目名或插件名，严禁裸写 C:/Users/... 等详细路径，brain/<id>/scratch 免申报；复杂任务先写 implementation_plan.md）；options 仅放极简按钮（如 [\"(Recommended) 确认执行\", \"暂不修改\"]）。";
+    const zhReason = state.isVoiceMode
+      ? "【方案门禁拦截 · 语音模式未授权】检测到尚未获得用户口头口令或弹窗点击确认即尝试执行" + actionDesc + "（工具：" + toolName + "）。请先说明要改哪些内容（若改工作区外请写明项目名或插件名，严禁裸写详细路径），然后等待用户明确说出「确认执行」（英文说 confirm and execute / confirm execute）或点击 ask_question 按钮后再执行！"
+      : "【方案门禁拦截 · 按单申请与工作区内外把控】检测到尚未通过按钮确认即尝试执行" + actionDesc + "（工具：" + toolName + "）。出方案前允许全盘调用只读工具免弹窗调研；执行任何修改前，必须同回合先在聊天正文（content）输出完整原因分析，再调用 ask_question 列出【纯修改方案】（若涉及工作区外修改只需写明外部项目名或插件名，严禁裸写 C:/Users/... 等详细路径，brain/<id>/scratch 免申报；复杂任务先写 implementation_plan.md）；options 仅放极简按钮（如 [\"(Recommended) 确认执行\", \"暂不修改\"]）。";
 
-    const enReason = "[Plan Guard Intercept | Scoped Permission Application] Attempted " + actionDescEn + " (tool: " + toolName + ") before user button confirmation! Full-disk read-only tools are allowed during research; before any modification, output full analysis in chat content first and call ask_question in the same turn with the pure modification plan (state external project/plugin names without raw full paths; brain/<id>/scratch is exempt); keep options to concise buttons ([\"(Recommended) Confirm & Execute\", \"Cancel\"]).";
+    const enReason = state.isVoiceMode
+      ? "[Plan Guard Intercept | Voice Mode Awaiting Approval] Attempted " + actionDescEn + " (tool: " + toolName + ") before obtaining voice passphrase or modal click confirmation! Present your modification plan first (name external project/plugin without raw full paths) and wait for the user to say exact \"confirm and execute\" / \"confirm execute\" (Chinese: \"确认执行\") or click ask_question."
+      : "[Plan Guard Intercept | Scoped Permission Application] Attempted " + actionDescEn + " (tool: " + toolName + ") before user button confirmation! Full-disk read-only tools are allowed during research; before any modification, output full analysis in chat content first and call ask_question in the same turn with the pure modification plan (state external project/plugin names without raw full paths; brain/<id>/scratch is exempt); keep options to concise buttons ([\"(Recommended) Confirm & Execute\", \"Cancel\"]).";
 
     return reply({
       decision: "deny",
@@ -360,11 +371,15 @@ function handlePostToolUse(payload) {
 
 function handlePreInvocation(payload) {
   let wsSummary = "";
+  let isVoiceMode = false;
   try {
     if (payload && payload.transcriptPath) {
       const synced = syncTranscriptState(payload.transcriptPath, payload);
       if (synced.exists && Array.isArray(synced.state.lockedWorkspaceRoots) && synced.state.lockedWorkspaceRoots.length > 0) {
         wsSummary = synced.state.lockedWorkspaceRoots.join(", ");
+      }
+      if (synced.exists && synced.state && synced.state.isVoiceMode) {
+        isVoiceMode = true;
       }
       if (synced.exists && synced.state.approved) {
         return reply({});
@@ -374,8 +389,14 @@ function handlePreInvocation(payload) {
   const userLang = detectUserLang(payload && payload.transcriptPath);
   const wsHintZh = wsSummary ? "（当前会话已独立固化工作区：" + wsSummary + "，前后台切换项目互不串扰）" : "";
   const wsHintEn = wsSummary ? " (Conversation-locked workspace: " + wsSummary + ", immune to foreground project switching)" : "";
-  const zhMessage = "【方案门禁在线（全盘只读免弹窗 · 按单申请修改与跨区权限 · 弹窗禁裸写长路径）】" + wsHintZh + " 1) 出方案前允许全盘调用任意只读工具（read_file/list_dir/grep_search/只读终端命令/research 子智能体）免弹窗勘测；2) 若当前会话是由主智能体委派的子智能体（Subagent，含 sender=<UUID>），严禁调用 ask_question 弹窗阻塞，直接在主智能体已获批的工作区与外部路径范围内并发执行！3) 若当前会话为主智能体（Main Agent），执行任何修改前必须同回合先输出聊天正文解释（content）再调用 ask_question 列出【纯修改方案】：方案中说明要改哪些内容（无需写明具体修改工具名，后台自动申请修改工具权限）；若涉及修改当前工作区外的内容，只需在方案中写明要改哪些工作区外的项目名或插件名（如「修改 antigravity-relay 插件」，严禁在 ask_question 文本中裸写 C:/Users/... 等详细绝对路径，且 brain/<id>/scratch 临时目录默认免申报，后台会自动从项目名、插件名及正文 [文件名](file:///...) 芯片映射外部目录权限）；options 仅放极简按钮（如 [\"(Recommended) 确认执行\", \"暂不修改\"]）。用户同意后自动放行已申请范围，未申请的工作区外修改将被严格拦截！";
-  const enMessage = "[Plan Guard Online (Full-Disk Read Free | Scoped Mutation & External Grants | No Raw Paths in Modal)]" + wsHintEn + " 1) Full-disk read-only tools (read_file/list_dir/grep_search/read-only commands/research subagent) are allowed without popups before proposing a plan; 2) If this conversation is a Subagent (woken by sender=<UUID>), NEVER call ask_question; execute directly within the parent's approved workspace and external path scope! 3) If this is the Main Agent, before any modification, output full explanation in chat content first and call ask_question in the same turn to list the pure modification plan: explain what will be modified (no need to list specific tool names; background automatically requests mutation tool permissions); if modifying anything outside the current workspace, state only the external project or plugin name (e.g., 'modify antigravity-relay plugin'—NEVER write raw full filesystem paths like C:/Users/... in ask_question text, and brain/<id>/scratch temp files require no declaration; background automatically resolves project/plugin names and [filename](file:///...) chips); keep options to concise buttons ([\"(Recommended) Confirm & Execute\", \"Cancel\"]). Approved scopes are allowed while undeclared external paths remain strictly blocked!";
+  const voiceHintZh = isVoiceMode
+    ? " 4) 【语音严格口令模式】当前处于语音交互：出完修改方案（含工作区外项目名/插件名与文件芯片）后可直接结束本回合，请用户明确说出「确认执行」（英文说「confirm and execute」或「confirm execute」）或点击弹窗确认；仅说“同意/可以/好的/yes/ok”均会被门禁拦截。"
+    : "";
+  const voiceHintEn = isVoiceMode
+    ? " 4) [Strict Voice Passphrase Mode] In voice mode, after explaining the modification plan (with external project/plugin names and file chips), you may yield the turn and ask the user to say the exact phrase \"confirm and execute\" or \"confirm execute\" (Chinese: \"确认执行\"), or click ask_question; casual words like \"yes/ok/sure\" are strictly blocked."
+    : "";
+  const zhMessage = "【方案门禁在线（全盘只读免弹窗 · 按单申请修改与跨区权限 · 弹窗禁裸写长路径）】" + wsHintZh + " 1) 出方案前允许全盘调用任意只读工具（read_file/list_dir/grep_search/只读终端命令/research 子智能体）免弹窗勘测；2) 若当前会话是由主智能体委派的子智能体（Subagent，含 sender=<UUID>），严禁调用 ask_question 弹窗阻塞，直接在主智能体已获批的工作区与外部路径范围内并发执行！3) 若当前会话为主智能体（Main Agent），执行任何修改前必须同回合先输出聊天正文解释（content）再调用 ask_question 列出【纯修改方案】：方案中说明要改哪些内容（无需写明具体修改工具名，后台自动申请修改工具权限）；若涉及修改当前工作区外的内容，只需在方案中写明要改哪些工作区外的项目名或插件名（如「修改 antigravity-relay 插件」，严禁在 ask_question 文本中裸写 C:/Users/... 等详细绝对路径，且 brain/<id>/scratch 临时目录默认免申报，后台会自动从项目名、插件名及正文 [文件名](file:///...) 芯片映射外部目录权限）；options 仅放极简按钮（如 [\"(Recommended) 确认执行\", \"暂不修改\"]）。用户同意后自动放行已申请范围，未申请的工作区外修改将被严格拦截！" + voiceHintZh;
+  const enMessage = "[Plan Guard Online (Full-Disk Read Free | Scoped Mutation & External Grants | No Raw Paths in Modal)]" + wsHintEn + " 1) Full-disk read-only tools (read_file/list_dir/grep_search/read-only commands/research subagent) are allowed without popups before proposing a plan; 2) If this conversation is a Subagent (woken by sender=<UUID>), NEVER call ask_question; execute directly within the parent's approved workspace and external path scope! 3) If this is the Main Agent, before any modification, output full explanation in chat content first and call ask_question in the same turn to list the pure modification plan: explain what will be modified (no need to list specific tool names; background automatically requests mutation tool permissions); if modifying anything outside the current workspace, state only the external project or plugin name (e.g., 'modify antigravity-relay plugin'—NEVER write raw full filesystem paths like C:/Users/... in ask_question text, and brain/<id>/scratch temp files require no declaration; background automatically resolves project/plugin names and [filename](file:///...) chips); keep options to concise buttons ([\"(Recommended) Confirm & Execute\", \"Cancel\"]). Approved scopes are allowed while undeclared external paths remain strictly blocked!" + voiceHintEn;
   return reply({
     injectSteps: [{
       ephemeralMessage: userLang === "zh" ? zhMessage : enMessage
@@ -390,6 +411,34 @@ async function handleStop(payload) {
       const reason = String(payload.terminationReason || "");
       if (reason === "USER_CANCELED" || (reason === "NO_TOOL_CALL" && payload.fullyIdle === true)) {
         const isSubagent = !synced.state.hasUserInput && synced.state.hasParentSenderMessage;
+        let nextVoiceAwaiting = false;
+        let nextVoiceGrants = createEmptyGrants();
+        let nextVoiceContent = "";
+        if (reason === "USER_CANCELED") {
+          if (
+            synced.state.isVoiceMode &&
+            !synced.state.approved &&
+            (synced.state.hasAskInTurn ||
+              synced.state.currentAskStepFound ||
+              synced.state.hasPlanProposalInTurn ||
+              synced.state.hasPlanSinceLastReset ||
+              (synced.state.pendingGrants && synced.state.pendingGrants.allowMutatingTools))
+          ) {
+            const planArtifactText = readCurrentConversationPlanArtifact(
+              payload.transcriptPath,
+              synced.state.hasPlanSinceLastReset || /implementation_plan\.md/i.test(synced.state.lastAssistantContent || "")
+            );
+            nextVoiceAwaiting = true;
+            nextVoiceGrants = mergeGrants(
+              synced.state.voicePendingGrants,
+              mergeGrants(
+                synced.state.pendingGrants,
+                extractScopeGrantsFromPlan([planArtifactText, synced.state.lastAssistantContent || ""], synced.state.lockedWorkspaceRoots, resolveHostHomeDir())
+              )
+            );
+            nextVoiceContent = synced.state.lastAssistantContent || synced.state.voiceProposedContent || "";
+          }
+        }
         if (reason === "NO_TOOL_CALL" && payload.fullyIdle === true && !isSubagent) {
           const wakeupCount = Number(synced.state.outerReplyWakeupCount) || 0;
           const toolCallsInTurn = Number(synced.state.turnToolCallCount) || 0;
@@ -417,12 +466,14 @@ async function handleStop(payload) {
             });
           }
 
-          if (!synced.state.approved && !synced.state.hasAskInTurn && (Number(synced.state.missingAskWakeupCount) || 0) < 1) {
+          if (!synced.state.approved) {
             const lastText = String(synced.state.lastAssistantContent || "");
             const hasProposal = Boolean(
               synced.state.hasPlanSinceLastReset ||
               synced.state.deniedGateInTurn ||
               synced.state.hasPlanProposalInTurn ||
+              synced.state.hasAskInTurn ||
+              (synced.state.pendingGrants && synced.state.pendingGrants.allowMutatingTools) ||
               hasPlanOrAccessProposalInText(lastText, synced.state.lockedWorkspaceRoots, resolveHostHomeDir())
             );
             const hadPriorToolOrAccess = Boolean(
@@ -431,16 +482,31 @@ async function handleStop(payload) {
               synced.state.deniedGateInTurn ||
               synced.state.hasPlanSinceLastReset
             );
-            if (hasProposal && hadPriorToolOrAccess) {
-              synced.state.missingAskWakeupCount = (Number(synced.state.missingAskWakeupCount) || 0) + 1;
-              saveState(synced.statePath, synced.state);
-              const userLang = detectUserLang(payload.transcriptPath);
-              return reply({
-                decision: "continue",
-                reason: userLang === "zh"
-                  ? "【方案门禁提醒 · 漏调 ask_question 确认弹窗】检测到你在本轮出方案前已申请工具调用或路径访问权限（或已输出修改方案/尝试调用受控工具），但本轮未调用 ask_question 弹出确认窗口！本门禁仅支持点击 ask_question 弹窗确认，请立即调用 ask_question（在 question 中列出修改方案与外部项目/插件名，严禁裸写详细路径，options 固定为 [\"(Recommended) 确认执行\", \"暂不修改\"]）供用户点击确认。"
-                  : "[Plan Guard Reminder | Missing ask_question Popup] Detected that you requested tool calls or path access permissions (or output a modification plan / attempted a gated tool) in this turn without calling ask_question! Confirmation is click-only via ask_question: please immediately call ask_question (list the modification plan and external project/plugin names without raw full paths, with options [\"(Recommended) Confirm & Execute\", \"Cancel\"])."
-              });
+            if (synced.state.isVoiceMode) {
+              if (hasProposal) {
+                const planArtifactText = readCurrentConversationPlanArtifact(
+                  payload.transcriptPath,
+                  synced.state.hasPlanSinceLastReset || /implementation_plan\.md/i.test(lastText)
+                );
+                nextVoiceAwaiting = true;
+                nextVoiceGrants = mergeGrants(
+                  synced.state.pendingGrants,
+                  extractScopeGrantsFromPlan([planArtifactText, lastText], synced.state.lockedWorkspaceRoots, resolveHostHomeDir())
+                );
+                nextVoiceContent = lastText;
+              }
+            } else if (!synced.state.hasAskInTurn && (Number(synced.state.missingAskWakeupCount) || 0) < 1) {
+              if (hasProposal && hadPriorToolOrAccess) {
+                synced.state.missingAskWakeupCount = (Number(synced.state.missingAskWakeupCount) || 0) + 1;
+                saveState(synced.statePath, synced.state);
+                const userLang = detectUserLang(payload.transcriptPath);
+                return reply({
+                  decision: "continue",
+                  reason: userLang === "zh"
+                    ? "【方案门禁提醒 · 漏调 ask_question 确认弹窗】检测到你在本轮出方案前已申请工具调用或路径访问权限（或已输出修改方案/尝试调用受控工具），但本轮未调用 ask_question 弹出确认窗口！本门禁仅支持点击 ask_question 弹窗确认，请立即调用 ask_question（在 question 中列出修改方案与外部项目/插件名，严禁裸写详细路径，options 固定为 [\"(Recommended) 确认执行\", \"暂不修改\"]）供用户点击确认。"
+                    : "[Plan Guard Reminder | Missing ask_question Popup] Detected that you requested tool calls or path access permissions (or output a modification plan / attempted a gated tool) in this turn without calling ask_question! Confirmation is click-only via ask_question: please immediately call ask_question (list the modification plan and external project/plugin names without raw full paths, with options [\"(Recommended) Confirm & Execute\", \"Cancel\"])."
+                });
+              }
             }
           }
         }
@@ -449,6 +515,9 @@ async function handleStop(payload) {
         synced.state.approvedStepIndex = -1;
         synced.state.pendingGrants = createEmptyGrants();
         synced.state.approvedGrants = createEmptyGrants();
+        synced.state.awaitingVoiceApproval = nextVoiceAwaiting;
+        synced.state.voicePendingGrants = nextVoiceGrants;
+        synced.state.voiceProposedContent = nextVoiceContent;
         synced.state.activeBgTasks = {};
         synced.state.turnToolCallCount = 0;
         synced.state.lastPlannerStepHasToolCalls = false;
