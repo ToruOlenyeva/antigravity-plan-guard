@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>方案门禁</title>
+  <script>
+    (function() {
+      var isDark = true;
+      try {
+        var saved = localStorage.getItem("antigravity_theme_mode");
+        if (saved === "light") isDark = false;
+        else if (saved === "dark") isDark = true;
+        else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) isDark = false;
+      } catch (e) {}
+      document.documentElement.setAttribute("data-theme", isDark ? "dark" : "light");
+    })();
+  </script>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="header">
+    <div class="header-left">
+      <h1 id="uiAppTitle">方案门禁</h1>
+      <span class="badge mode-badge" id="uiModeBadge">白名单模式</span>
+    </div>
+    <div class="header-actions">
+      <button type="button" class="secondary small" id="langToggleBtn">EN</button>
+      <button type="button" class="secondary small" id="refreshBtn">刷新</button>
+    </div>
+  </header>
+
+  <main class="main-stack">
+    <!-- 1. 命令拦截模式与内置只读选项 -->
+    <section class="section-card" aria-labelledby="secModeLegend">
+      <fieldset class="mode-fieldset">
+        <legend class="section-title" id="secModeLegend">终端命令拦截模式</legend>
+        <div class="mode-segment" id="modeSegmentGroup">
+          <div class="mode-option">
+            <input type="radio" id="modeRadioWhitelist" name="policyMode" value="whitelist" checked>
+            <label for="modeRadioWhitelist" id="modeLabelWhitelist">白名单模式</label>
+          </div>
+          <div class="mode-option">
+            <input type="radio" id="modeRadioBlacklist" name="policyMode" value="blacklist">
+            <label for="modeRadioBlacklist" id="modeLabelBlacklist">黑名单模式</label>
+          </div>
+        </div>
+      </fieldset>
+
+      <div class="mode-desc-banner" id="modeDescBanner">
+        仅免弹窗直接放行白名单中的命令，其余终端命令需经确认弹窗审批后执行。
+      </div>
+
+      <div class="switch-row" id="builtinReadonlyRow">
+        <div class="switch-text-col">
+          <label for="builtinReadonlyToggle" class="switch-title" id="builtinToggleLabel">同时放行内置只读命令</label>
+          <span class="switch-hint" id="builtinToggleHint" title="">自动免弹窗放行 git status / ls / node -c / cargo check 等只读检查</span>
+        </div>
+        <input type="checkbox" switch id="builtinReadonlyToggle" name="includeBuiltinReadOnly" class="native-switch" checked>
+      </div>
+    </section>
+
+    <!-- 2. 命令名单管理 -->
+    <section class="section-card" aria-labelledby="secRulesTitle">
+      <div class="section-header">
+        <div class="section-title-wrap">
+          <h2 class="section-title" id="secRulesTitle">白名单命令</h2>
+          <span class="count-pill" id="rulesCountPill">0</span>
+        </div>
+        <div class="btn-group">
+          <button type="button" class="secondary small" id="btnToggleBatch" aria-expanded="false" aria-controls="batchAddDrawer">批量导入</button>
+          <button type="button" class="danger small" id="btnResetDefaults">恢复默认</button>
+        </div>
+      </div>
+
+      <form id="addRuleForm" class="add-rule-form" aria-labelledby="secRulesTitle">
+        <label for="newRuleInput" class="visually-hidden" id="newRuleLabel">输入要加入名单的命令规则</label>
+        <input
+          type="text"
+          id="newRuleInput"
+          name="rulePattern"
+          class="text-input mono"
+          placeholder="输入命令前缀、通配符或 /正则/，例如 npm run build"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="none"
+          spellcheck="false"
+          enterkeyhint="done"
+        >
+        <button type="submit" class="primary small" id="btnAddRule">添加</button>
+      </form>
+
+      <form id="batchAddDrawer" class="batch-drawer" aria-labelledby="batchRuleLabel" hidden>
+        <label for="batchRuleTextarea" class="batch-label" id="batchRuleLabel">批量粘贴命令规则（每行一条，自动去重）</label>
+        <textarea
+          id="batchRuleTextarea"
+          name="batchPatterns"
+          class="text-area mono"
+          rows="4"
+          placeholder="npm run build&#10;pnpm test*&#10;/^cargo\s+clippy/i"
+          autocorrect="off"
+          autocapitalize="none"
+          spellcheck="false"
+        ></textarea>
+        <div class="batch-actions">
+          <button type="button" class="secondary small" id="btnCancelBatch">收起</button>
+          <button type="submit" class="primary small" id="btnConfirmBatch">确认导入</button>
+        </div>
+      </form>
+
+      <div class="syntax-hint" id="syntaxHintText">
+        支持前缀边界匹配（如 npm run build）、通配符 *（如 npm run test*）或 /正则/i；组合命令会逐段校验。
+      </div>
+
+      <search class="rule-search-wrap">
+        <label for="ruleSearchInput" class="visually-hidden" id="ruleSearchLabel">筛选命令规则</label>
+        <svg class="search-icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="9" cy="9" r="6"></circle>
+          <line x1="13.5" y1="13.5" x2="17.5" y2="17.5"></line>
+        </svg>
+        <input
+          type="search"
+          id="ruleSearchInput"
+          name="ruleFilter"
+          class="search-input"
+          placeholder="筛选当前名单中的命令..."
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="none"
+          spellcheck="false"
+          enterkeyhint="search"
+        >
+        <button type="button" class="search-clear-btn" id="ruleSearchClearBtn" aria-label="清空筛选" hidden>×</button>
+      </search>
+
+      <ul class="rule-list" id="ruleList"></ul>
+    </section>
+
+    <!-- 3. 命令匹配实时测试器 -->
+    <section class="section-card" aria-labelledby="secTesterTitle">
+      <div class="section-header">
+        <h2 class="section-title" id="secTesterTitle">命令匹配测试</h2>
+      </div>
+      <form id="cmdTesterForm" class="add-rule-form" aria-labelledby="secTesterTitle">
+        <label for="cmdTesterInput" class="visually-hidden" id="cmdTesterLabel">输入完整命令行测试放行或拦截</label>
+        <input
+          type="text"
+          id="cmdTesterInput"
+          name="testCommand"
+          class="text-input mono"
+          placeholder="输入命令行测试，例如 npm run build && rm -rf dist"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="none"
+          spellcheck="false"
+          enterkeyhint="done"
+        >
+        <button type="submit" class="secondary small" id="btnRunTest">测试</button>
+      </form>
+      <div id="cmdTesterResult" class="tester-result" aria-live="polite" hidden></div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="/i18n.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -141,13 +141,16 @@ function handlePreToolUse(payload) {
       }
     }
 
-    // 阶段 4：终端命令只读审计
+    // 阶段 4：终端命令白名单/黑名单与只读策略审计
+    let deniedCmdAudit = null;
     if (EXEC_CMD_TOOLS.has(toolName)) {
       const cmd = String(args.CommandLine || args.command || "").trim();
-      if (isPureReadOnlyCommand(cmd)) {
+      const cmdAudit = auditMod.evaluateTerminalCommand(cmd);
+      if (cmdAudit.decision === "allow") {
         markReadRequestIfNeeded();
         return reply({ decision: "allow" });
       }
+      deniedCmdAudit = cmdAudit;
     }
 
     if (!synced.exists) {
@@ -321,8 +324,13 @@ function handlePreToolUse(payload) {
     let actionDesc = "状态修改或代码写盘操作";
     let actionDescEn = "state mutation or file writing";
     if (toolName === "run_command" || toolName === "Bash") {
-      actionDesc = "具有环境或服务修改副作用的终端命令";
-      actionDescEn = "terminal commands with environmental/service side effects";
+      if (deniedCmdAudit && deniedCmdAudit.mode === "blacklist" && deniedCmdAudit.matchedRule) {
+        actionDesc = "命中黑名单规则（" + deniedCmdAudit.matchedRule + "）的终端命令";
+        actionDescEn = "terminal commands matching blacklist rule (" + deniedCmdAudit.matchedRule + ")";
+      } else {
+        actionDesc = "具有环境或服务修改副作用的终端命令";
+        actionDescEn = "terminal commands with environmental/service side effects";
+      }
     } else if (toolName === "invoke_subagent" || toolName === "Task") {
       actionDesc = "派发写盘/执行类子智能体";
       actionDescEn = "dispatching mutating subagents";
