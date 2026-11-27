@@ -6,13 +6,41 @@
   <title>方案门禁</title>
   <script>
     (function() {
+      var uiStyle = "modern";
+      var fontScale = "auto";
+      var fontScaleNum = 1;
+      var hostFontFamily = "";
       var isDark = true;
       try {
-        var saved = localStorage.getItem("antigravity_theme_mode");
-        if (saved === "light") isDark = false;
-        else if (saved === "dark") isDark = true;
-        else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) isDark = false;
+        var savedStyle = localStorage.getItem("plan_guard_ui_style");
+        if (savedStyle === "classic" || savedStyle === "modern") uiStyle = savedStyle;
+        var savedFont = localStorage.getItem("plan_guard_font_scale");
+        if (savedFont === "auto" || savedFont === "sm" || savedFont === "md" || savedFont === "lg") fontScale = savedFont;
+        if (fontScale === "sm") fontScaleNum = 0.88;
+        else if (fontScale === "lg") fontScaleNum = 1.15;
+        else if (fontScale === "auto") {
+          var hostPx = parseFloat(localStorage.getItem("antigravity_host_font_px") || "");
+          if (isFinite(hostPx) && hostPx > 0) {
+            fontScaleNum = Math.round(Math.min(1.45, Math.max(0.82, hostPx / 14)) * 1000) / 1000;
+          }
+        }
+        hostFontFamily = localStorage.getItem("antigravity_host_font_family") || "";
+        var themePref = localStorage.getItem("plan_guard_theme_pref") || "auto";
+        if (themePref === "light") isDark = false;
+        else if (themePref === "dark") isDark = true;
+        else {
+          var saved = localStorage.getItem("antigravity_theme_mode");
+          if (saved === "light") isDark = false;
+          else if (saved === "dark") isDark = true;
+          else if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) isDark = false;
+        }
       } catch (e) {}
+      document.documentElement.setAttribute("data-ui-style", uiStyle);
+      document.documentElement.setAttribute("data-font-scale", fontScale);
+      document.documentElement.style.setProperty("--ui-font-scale", String(fontScaleNum));
+      if (hostFontFamily) {
+        document.documentElement.style.setProperty("--ui-font-family", hostFontFamily);
+      }
       document.documentElement.setAttribute("data-theme", isDark ? "dark" : "light");
     })();
   </script>
@@ -26,12 +54,18 @@
       <span class="badge mode-badge" id="uiModeBadge">白名单模式</span>
     </div>
     <div class="header-actions">
-      <button type="button" class="secondary small" id="langToggleBtn">EN</button>
+      <button type="button" class="header-update-pill" id="headerUpdatePill" style="display: none;" onclick="switchMainTab('preferences')"></button>
       <button type="button" class="secondary small" id="refreshBtn">刷新</button>
     </div>
   </header>
 
-  <main class="main-stack">
+  <!-- 顶部主导航切换栏（拦截规则 / 偏好设置） -->
+  <div class="top-tab-bar" role="tablist">
+    <button type="button" class="top-tab-btn active" id="tabMainBtn" role="tab" onclick="switchMainTab('main')">拦截规则</button>
+    <button type="button" class="top-tab-btn" id="tabPrefsBtn" role="tab" onclick="switchMainTab('preferences')">偏好设置</button>
+  </div>
+
+  <main class="main-stack" id="mainView">
     <!-- 1. 命令拦截模式与内置只读选项 -->
     <section class="section-card" aria-labelledby="secModeLegend">
       <fieldset class="mode-fieldset">
@@ -162,9 +196,12 @@
     </section>
   </main>
 
+  <div id="preferencesView" style="display: none;"></div>
+
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
   <script src="/i18n.js"></script>
+  <script src="/ui-prefs.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

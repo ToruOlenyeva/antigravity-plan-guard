@@ -1,8 +1,7 @@
 // Antigravity Plan Guard Sidecar Panel Controller
-let savedLang = null;
-try { savedLang = localStorage.getItem("plan_guard_lang"); } catch (e) {}
-const defaultBrowserLang = (typeof navigator !== "undefined" && typeof navigator.language === "string" && /^zh\b/i.test(navigator.language)) ? "zh" : "en";
-let currentLang = (savedLang === "en" || savedLang === "zh") ? savedLang : defaultBrowserLang;
+let currentLang = typeof resolveEffectiveLang === "function"
+  ? resolveEffectiveLang()
+  : ((typeof navigator !== "undefined" && typeof navigator.language === "string" && /^zh\b/i.test(navigator.language)) ? "zh" : "en");
 
 let policyState = {
   version: 1,
@@ -65,8 +64,13 @@ window.addEventListener("message", (event) => {
     if (bg) {
       const isLight = bg.startsWith("#f") || bg.startsWith("#e") || bg.startsWith("#d") || bg === "white" || bg.startsWith("rgb(25") || bg.startsWith("rgb(24");
       const mode = isLight ? "light" : "dark";
-      document.documentElement.setAttribute("data-theme", mode);
       try { localStorage.setItem("antigravity_theme_mode", mode); } catch (e) {}
+      if (typeof getThemePref !== "function" || getThemePref() === "auto") {
+        document.documentElement.setAttribute("data-theme", mode);
+      }
+    }
+    if (typeof handleHostThemeFontVars === "function") {
+      handleHostThemeFontVars(vars);
     }
   }
 });
@@ -74,8 +78,9 @@ window.addEventListener("message", (event) => {
 if (typeof window !== "undefined" && window.matchMedia) {
   try {
     window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", (e) => {
-      const mode = e.matches ? "light" : "dark";
-      document.documentElement.setAttribute("data-theme", mode);
+      if (typeof getThemePref !== "function" || getThemePref() === "auto") {
+        document.documentElement.setAttribute("data-theme", e.matches ? "light" : "dark");
+      }
     });
   } catch (e) {}
 }
@@ -104,7 +109,12 @@ function applyI18n() {
   const t = I18N[currentLang];
   document.documentElement.lang = currentLang === "zh" ? "zh-CN" : "en";
   document.getElementById("uiAppTitle").textContent = t.appTitle;
-  document.getElementById("langToggleBtn").textContent = t.langBtn;
+  const langBtn = document.getElementById("langToggleBtn");
+  if (langBtn) langBtn.textContent = t.langBtn;
+  const tabMain = document.getElementById("tabMainBtn");
+  if (tabMain) tabMain.textContent = t.tabMain || "拦截规则";
+  const tabPrefs = document.getElementById("tabPrefsBtn");
+  if (tabPrefs) tabPrefs.textContent = t.tabPreferences || "偏好设置";
   document.getElementById("refreshBtn").textContent = t.refreshBtn;
   document.getElementById("secModeLegend").textContent = t.secModeLegend;
   document.getElementById("modeLabelWhitelist").textContent = t.modeLabelWhitelist;
@@ -120,6 +130,10 @@ function applyI18n() {
   document.getElementById("secTesterTitle").textContent = t.secTesterTitle;
   document.getElementById("cmdTesterInput").placeholder = t.cmdTesterPlaceholder;
   document.getElementById("btnRunTest").textContent = t.btnRunTest;
+  if (typeof syncHeaderUpdatePill === "function") syncHeaderUpdatePill();
+  if (typeof renderPreferencesView === "function" && typeof activeMainTab !== "undefined" && activeMainTab === "preferences") {
+    renderPreferencesView();
+  }
   resetConfirmButtonState();
   renderAll();
 }
@@ -522,6 +536,9 @@ async function loadConfigFromServer(showNotice = false) {
       policyState = data.config;
       if (data.version) currentVersionToken = data.version;
       if (Array.isArray(data.builtinReadOnlyExamples)) builtinExamples = data.builtinReadOnlyExamples;
+      if (data.hostAppearance && typeof syncHostAppearanceFromSnapshot === "function") {
+        syncHostAppearanceFromSnapshot(data.hostAppearance);
+      }
       renderAll();
       scheduleCommandTesterRun();
       if (showNotice) showToast(I18N[currentLang].toastRefreshed);
@@ -582,16 +599,19 @@ function setupRealtimeSync() {
 }
 
 function bindEvents() {
-  document.getElementById("langToggleBtn").addEventListener("click", () => {
-    currentLang = currentLang === "zh" ? "en" : "zh";
-    try { localStorage.setItem("plan_guard_lang", currentLang); } catch (e) {}
-    applyI18n();
-    fetch("/api/set-language", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ lang: currentLang })
-    }).catch(() => {});
-  });
+  const langToggleBtn = document.getElementById("langToggleBtn");
+  if (langToggleBtn) {
+    langToggleBtn.addEventListener("click", () => {
+      currentLang = currentLang === "zh" ? "en" : "zh";
+      try { localStorage.setItem("plan_guard_lang", currentLang); } catch (e) {}
+      applyI18n();
+      fetch("/api/set-language", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lang: currentLang })
+      }).catch(() => {});
+    });
+  }
 
   document.getElementById("refreshBtn").addEventListener("click", () => {
     loadConfigFromServer(true);
@@ -683,3 +703,6 @@ function bindEvents() {
 bindEvents();
 applyI18n();
 loadConfigFromServer(false).then(setupRealtimeSync);
+if (typeof loadUpdaterStatus === "function") {
+  loadUpdaterStatus();
+}

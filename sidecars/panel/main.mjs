@@ -4,6 +4,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
+import {
+  getUpdaterStatus,
+  setUpdaterConfig,
+  checkForPluginUpdate,
+  performPluginUpdate
+} from "./plugin-updater.mjs";
 
 const require = createRequire(import.meta.url);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -24,7 +30,93 @@ const APP_DATA_DIR = (process.platform === "win32" && fs.existsSync(path.join(HO
   ? path.join(HOME_DIR, "AppData", "Roaming")
   : (process.env.APPDATA || (process.platform === "darwin" ? path.join(HOME_DIR, "Library", "Application Support") : path.join(HOME_DIR, ".config")));
 const PLUGINS_DIR = path.join(HOME_DIR, ".gemini", "config", "plugins");
+const CONFIG_FILE = path.join(HOME_DIR, ".gemini", "config", "config.json");
 const APP_STORAGE_FILE = path.join(APP_DATA_DIR, "Antigravity", "app_storage.json");
+
+let cachedHostAppearance = { mtimeMs: -1, storageMtimeMs: -1, value: { fontSizePx: null, fontFamily: "" } };
+
+function parseHostConfigFontPx(raw) {
+  if (raw === undefined || raw === null || raw === "") return null;
+  if (typeof raw === "number") {
+    return Number.isFinite(raw) && raw >= 9 && raw <= 36 ? raw : null;
+  }
+  const str = String(raw).trim();
+  if (!str) return null;
+  const upper = str.toUpperCase();
+  if (upper.includes("SMALL") || upper === "SM") return 12;
+  if (upper.includes("LARGE") && !upper.includes("EXTRA")) return 16;
+  if (upper.includes("EXTRA_LARGE") || upper === "XL") return 18;
+  if (upper.includes("DEFAULT") || upper.includes("MEDIUM") || upper === "MD") return 14;
+  const pxMatch = str.match(/^(\d+(?:\.\d+)?)\s*px$/i);
+  if (pxMatch) {
+    const n = parseFloat(pxMatch[1]);
+    return Number.isFinite(n) && n >= 9 && n <= 36 ? n : null;
+  }
+  if (/^\d+(?:\.\d+)?$/.test(str)) {
+    const n = parseFloat(str);
+    return Number.isFinite(n) && n >= 9 && n <= 36 ? n : null;
+  }
+  return null;
+}
+
+function readHostAppearanceFromConfig() {
+  try {
+    const cfgMtimeMs = fs.existsSync(CONFIG_FILE) ? fs.statSync(CONFIG_FILE).mtimeMs : 0;
+    const storMtimeMs = fs.existsSync(APP_STORAGE_FILE) ? fs.statSync(APP_STORAGE_FILE).mtimeMs : 0;
+    if (
+      cachedHostAppearance.mtimeMs === cfgMtimeMs &&
+      cachedHostAppearance.storageMtimeMs === storMtimeMs
+    ) {
+      return cachedHostAppearance.value;
+    }
+    let fontSizePx = null;
+    let fontFamily = "";
+    if (cfgMtimeMs > 0) {
+      const parsed = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
+      const us = parsed?.userSettings && typeof parsed.userSettings === "object" ? parsed.userSettings : {};
+      for (const k of ["fontSize", "uiFontSize", "chatFontSize", "baseFontSize", "textSize", "appearanceFontSize"]) {
+        const px = parseHostConfigFontPx(us[k]);
+        if (px !== null) {
+          fontSizePx = px;
+          break;
+        }
+      }
+      for (const k of ["fontFamily", "font", "uiFontFamily", "appearanceFontFamily"]) {
+        const fam = typeof us[k] === "string" ? us[k].trim() : "";
+        if (fam && !/^(default|inherit|auto)$/i.test(fam)) {
+          fontFamily = fam;
+          break;
+        }
+      }
+    }
+    if ((fontSizePx === null || !fontFamily) && storMtimeMs > 0) {
+      const stor = JSON.parse(fs.readFileSync(APP_STORAGE_FILE, "utf8"));
+      if (fontSizePx === null) {
+        for (const k of ["fontSize", "uiFontSize", "chatFontSize", "baseFontSize"]) {
+          const px = parseHostConfigFontPx(stor?.[k]);
+          if (px !== null) {
+            fontSizePx = px;
+            break;
+          }
+        }
+      }
+      if (!fontFamily) {
+        for (const k of ["fontFamily", "font", "uiFontFamily"]) {
+          const fam = typeof stor?.[k] === "string" ? stor[k].trim() : "";
+          if (fam && !/^(default|inherit|auto)$/i.test(fam)) {
+            fontFamily = fam;
+            break;
+          }
+        }
+      }
+    }
+    const result = { fontSizePx, fontFamily };
+    cachedHostAppearance = { mtimeMs: cfgMtimeMs, storageMtimeMs: storMtimeMs, value: result };
+    return result;
+  } catch {
+    return { fontSizePx: null, fontFamily: "" };
+  }
+}
 const PRELOAD_SDK_PATH = path.join(HOME_DIR, ".gemini", "antigravity", "lib", "node_modules", "sidecar_sdk", "preload.js");
 const RULES_FILE = getRulesFilePath();
 const PORT = Number(process.env.ANTIGRAVITY_SIDECAR_WEB_PORT || process.env.PORT || 8090);
@@ -140,7 +232,7 @@ if (process.env.ANTIGRAVITY_SIDECAR_WEB_PORT) {
 }
 
 // 后端文件变更自动退出由宿主 restart_policy: always 拉起最新代码
-for (const watchPath of [path.join(__dirname, "main.mjs"), path.resolve(__dirname, "../../lib/command-policy.cjs")]) {
+for (const watchPath of [path.join(__dirname, "main.mjs"), path.join(__dirname, "plugin-updater.mjs"), path.resolve(__dirname, "../../lib/command-policy.cjs")]) {
   try {
     fs.watchFile(watchPath, { interval: 1500, persistent: false }, (curr, prev) => {
       if (curr.mtimeMs !== prev.mtimeMs) {
@@ -292,6 +384,9 @@ async function requestHandler(req, res) {
   if (req.method === "GET" && pathname === "/i18n.js") {
     return serveStaticFile(res, path.join(__dirname, "i18n.js"), "application/javascript; charset=utf-8");
   }
+  if (req.method === "GET" && pathname === "/ui-prefs.js") {
+    return serveStaticFile(res, path.join(__dirname, "ui-prefs.js"), "application/javascript; charset=utf-8");
+  }
   if (req.method === "GET" && pathname === "/app.js") {
     return serveStaticFile(res, path.join(__dirname, "app.js"), "application/javascript; charset=utf-8");
   }
@@ -311,8 +406,42 @@ async function requestHandler(req, res) {
       version: buildVersionToken(cfg),
       primaryPort: actualPrimaryPort,
       standalonePort: actualStandalonePort || actualPrimaryPort,
-      builtinReadOnlyExamples: BUILTIN_READONLY_EXAMPLES
+      builtinReadOnlyExamples: BUILTIN_READONLY_EXAMPLES,
+      hostAppearance: readHostAppearanceFromConfig()
     });
+  }
+
+  if (req.method === "GET" && pathname === "/api/updater-status") {
+    try {
+      return sendJson(res, 200, { success: true, ...(await getUpdaterStatus()) });
+    } catch (err) {
+      return sendJson(res, 500, { success: false, error: err.message });
+    }
+  }
+  if (req.method === "POST" && pathname === "/api/updater-check") {
+    try {
+      return sendJson(res, 200, await checkForPluginUpdate({ force: true }));
+    } catch (err) {
+      return sendJson(res, 500, { success: false, error: err.message });
+    }
+  }
+  if (req.method === "POST" && pathname === "/api/updater-config") {
+    try {
+      const body = await readJsonBody(req).catch(() => ({}));
+      return sendJson(res, 200, { success: true, ...(await setUpdaterConfig(body)) });
+    } catch (err) {
+      return sendJson(res, 500, { success: false, error: err.message });
+    }
+  }
+  if (req.method === "POST" && pathname === "/api/updater-apply") {
+    try {
+      const result = await performPluginUpdate({
+        onUpdatedRestart: () => setTimeout(() => process.exit(0), 250)
+      });
+      return sendJson(res, 200, result);
+    } catch (err) {
+      return sendJson(res, 500, { success: false, error: err.message });
+    }
   }
 
   if (req.method === "GET" && pathname === "/api/state-version") {
@@ -617,3 +746,15 @@ function bindAdditionalPlanGuardPorts(forceScan = false) {
 bindAdditionalPlanGuardPorts(true);
 setTimeout(() => bindAdditionalPlanGuardPorts(true), 4000);
 setInterval(() => bindAdditionalPlanGuardPorts(false), 30000).unref();
+
+setTimeout(async () => {
+  try {
+    const st = await getUpdaterStatus();
+    if (st.updateMode === "off") return;
+    if (Date.now() - Number(st.lastCheckedAt || 0) < 6 * 3600 * 1000) return;
+    const checked = await checkForPluginUpdate({ force: false });
+    if (checked.updateMode === "auto" && checked.hasUpdate && (checked.installMode === "zip" || checked.worktreeClean)) {
+      await performPluginUpdate({ onUpdatedRestart: () => setTimeout(() => process.exit(0), 250) });
+    }
+  } catch {}
+}, 8000).unref();
